@@ -63,6 +63,10 @@ struct State {
 	std::string	id;			// the folder's name, state_2026-10-15_17:52:34
 	std::string	label;		// 2026-10-15 17:52:34
 	NameSet		packages;	// what was active in it
+	NameSet		files;		// the package files in its folder (the ones its change took out)
+	int			changes;	// how many packages differ from the system now
+	bool		restorable;	// all of what it needs is there, and it differs from now
+	State() : changes(0), restorable(false) {}
 };
 
 
@@ -123,6 +127,33 @@ CurrentPackages()
 }
 
 
+// What is in the packages folder and in the folders of earlier restores, read once for each loading of the states.
+static NameSet gPackageFiles;
+static std::map<std::string, std::string> gHeldFiles;
+
+struct Plan;
+static Plan MakePlan(const State& target, const std::vector<State>& states, const std::set<std::string>* excluded = NULL);
+
+
+static void
+ScanFolderForPackages(const std::string& folder, NameSet* names, std::map<std::string, std::string>* paths)
+{
+	DIR* dir = opendir(folder.c_str());
+	if (dir == NULL)
+		return;
+	while (struct dirent* entry = readdir(dir)) {
+		size_t length = strlen(entry->d_name);
+		if (length < 5 || strcmp(entry->d_name + length - 5, ".hpkg") != 0)
+			continue;
+		if (names != NULL)
+			names->insert(entry->d_name);
+		if (paths != NULL && paths->count(entry->d_name) == 0)
+			(*paths)[entry->d_name] = folder + "/" + entry->d_name;
+	}
+	closedir(dir);
+}
+
+
 // newest first
 static std::vector<State>
 LoadStates()
@@ -139,10 +170,23 @@ LoadStates()
 		state.label = LabelOf(state.id);
 		if (!ReadList(std::string(kAdminDir) + "/" + state.id + "/activated-packages", state.packages))
 			continue;
+		ScanFolderForPackages(std::string(kAdminDir) + "/" + state.id, &state.files, NULL);
 		states.push_back(state);
 	}
 	closedir(dir);
 	std::sort(states.begin(), states.end(), [](const State& a, const State& b) { return a.id > b.id; });
+
+	gPackageFiles.clear();
+	gHeldFiles.clear();
+	ScanFolderForPackages(kPackagesDir, &gPackageFiles, NULL);
+	std::string held = HoldRoot() + "/held";
+	if (DIR* heldDir = opendir(held.c_str())) {
+		while (struct dirent* entry = readdir(heldDir)) {
+			if (entry->d_name[0] != '.')
+				ScanFolderForPackages(held + "/" + entry->d_name, NULL, &gHeldFiles);
+		}
+		closedir(heldDir);
+	}
 	return states;
 }
 
@@ -201,37 +245,25 @@ struct Plan {
 
 
 // A package file of an earlier state: in the packages folder, in the folder of a state that removed it, or in the
-// ones kept by an earlier restore.
+// ones kept by an earlier restore. States in `excluded` are not looked in (they are about to be deleted).
 static std::string
-FindPackageFile(const std::string& name, const std::vector<State>& states)
+FindPackageFile(const std::string& name, const std::vector<State>& states, const std::set<std::string>* excluded)
 {
-	std::string path = std::string(kPackagesDir) + "/" + name;
-	if (Exists(path))
-		return path;
+	if (gPackageFiles.count(name) != 0)
+		return std::string(kPackagesDir) + "/" + name;
 	for (size_t i = 0; i < states.size(); i++) {
-		path = std::string(kAdminDir) + "/" + states[i].id + "/" + name;
-		if (Exists(path))
-			return path;
+		if (states[i].files.count(name) != 0 && (excluded == NULL || excluded->count(states[i].id) == 0))
+			return std::string(kAdminDir) + "/" + states[i].id + "/" + name;
 	}
-	std::string held = HoldRoot() + "/held";
-	if (DIR* dir = opendir(held.c_str())) {
-		while (struct dirent* entry = readdir(dir)) {
-			if (entry->d_name[0] == '.')
-				continue;
-			path = held + "/" + entry->d_name + "/" + name;
-			if (Exists(path)) {
-				closedir(dir);
-				return path;
-			}
-		}
-		closedir(dir);
-	}
+	std::map<std::string, std::string>::const_iterator held = gHeldFiles.find(name);
+	if (held != gHeldFiles.end())
+		return held->second;
 	return "";
 }
 
 
 static Plan
-MakePlan(const State& target, const std::vector<State>& states)
+MakePlan(const State& target, const std::vector<State>& states, const std::set<std::string>* excluded)
 {
 	Plan plan;
 	NameSet current = CurrentPackages();
@@ -247,7 +279,7 @@ MakePlan(const State& target, const std::vector<State>& states)
 		if (current.count(*it) != 0)
 			continue;
 		plan.add.push_back(*it);
-		std::string path = FindPackageFile(*it, states);
+		std::string path = FindPackageFile(*it, states, excluded);
 		if (path.empty())
 			plan.missing.push_back(*it);
 		else
@@ -311,6 +343,20 @@ ChangeCount(const Plan& plan)
 	for (size_t i = 0; i < plan.add.size(); i++)
 		bases.insert(BaseName(plan.add[i]));
 	return (int)bases.size();
+}
+
+
+// The states, with what each needs and what differs from now worked out.
+static std::vector<State>
+LoadAllStates()
+{
+	std::vector<State> states = LoadStates();
+	for (size_t i = 0; i < states.size(); i++) {
+		Plan plan = MakePlan(states[i], states);
+		states[i].changes = ChangeCount(plan);
+		states[i].restorable = plan.error.empty() && plan.missing.empty() && states[i].changes > 0;
+	}
+	return states;
 }
 
 
@@ -585,21 +631,43 @@ DeleteState(const std::string& id)
 static int
 CountBroken(const std::vector<State>& states, const std::set<std::string>& deleting)
 {
-	std::vector<State> remaining;
-	for (size_t i = 0; i < states.size(); i++) {
-		if (deleting.count(states[i].id) == 0)
-			remaining.push_back(states[i]);
-	}
 	int broken = 0;
-	for (size_t i = 0; i < remaining.size(); i++) {
-		Plan before = MakePlan(remaining[i], states);
-		if (!before.missing.empty() || ChangeCount(before) == 0)
+	for (size_t i = 0; i < states.size(); i++) {
+		if (!states[i].restorable || deleting.count(states[i].id) != 0)
 			continue;
-		Plan after = MakePlan(remaining[i], remaining);
+		Plan after = MakePlan(states[i], states, &deleting);
 		if (!after.missing.empty())
 			broken++;
 	}
 	return broken;
+}
+
+
+// The states that cannot be restored, or that are the same as the system now, and can be deleted without taking a file
+// that a state which can be restored needs. `kept` counts the ones left out for that reason.
+static std::vector<std::string>
+CleanupSet(const std::vector<State>& states, int* kept)
+{
+	std::set<std::string> deleting;
+	int keptCount = 0;
+	for (size_t i = 0; i < states.size(); i++) {
+		if (states[i].restorable)
+			continue;
+		if (states[i].files.empty()) {
+			deleting.insert(states[i].id);
+			continue;
+		}
+		// it has package files: only when no restorable state needs them
+		std::set<std::string> trial = deleting;
+		trial.insert(states[i].id);
+		if (CountBroken(states, trial) == 0)
+			deleting = trial;
+		else
+			keptCount++;
+	}
+	if (kept != NULL)
+		*kept = keptCount;
+	return std::vector<std::string>(deleting.begin(), deleting.end());
 }
 
 
@@ -623,6 +691,7 @@ enum {
 	kMsgSelected	= 'sel!',
 	kMsgRestore		= 'rst!',
 	kMsgDelete		= 'del!',
+	kMsgCleanup		= 'cln!',
 	kMsgUndo		= 'und!',
 	kMsgSyslog		= 'log!',
 	kMsgRestart		= 'rbt!',
@@ -786,6 +855,7 @@ public:
 		fRestore = new BButton("restore", "Restore selected state" B_UTF8_ELLIPSIS, new BMessage(kMsgRestore));
 		fUndo = new BButton("undo", "Undo last restore", new BMessage(kMsgUndo));
 		fDelete = new BButton("delete", "Delete selected" B_UTF8_ELLIPSIS, new BMessage(kMsgDelete));
+		fCleanup = new BButton("cleanup", "Delete unrestorable" B_UTF8_ELLIPSIS, new BMessage(kMsgCleanup));
 		fSyslog = new BButton("syslog", "Save syslog to Desktop", new BMessage(kMsgSyslog));
 		fRestart = new BButton("restart", "Restart" B_UTF8_ELLIPSIS, new BMessage(kMsgRestart));
 		fStatus = new BStringView("status", "");
@@ -807,6 +877,7 @@ public:
 				.Add(fRestore)
 				.Add(fUndo)
 				.Add(fDelete)
+				.Add(fCleanup)
 				.Add(fSyslog)
 				.AddGlue()
 				.Add(fRestart)
@@ -836,6 +907,9 @@ public:
 				break;
 			case kMsgDelete:
 				StartDelete();
+				break;
+			case kMsgCleanup:
+				StartCleanup();
 				break;
 			case kMsgSyslog:
 			{
@@ -875,7 +949,7 @@ private:
 
 	void Reload()
 	{
-		fStates = LoadStates();
+		fStates = LoadAllStates();
 		fList->MakeEmpty();
 
 		NameSet current = CurrentPackages();
@@ -899,10 +973,9 @@ private:
 		// only the states that can be restored: they have what the system has not, and all of their files are there
 		int added = 0;
 		for (size_t i = 0; i < fStates.size(); i++) {
-			Plan plan = MakePlan(fStates[i], fStates);
-			int changes = ChangeCount(plan);
-			if (changes == 0 || !plan.missing.empty() || !plan.error.empty())
+			if (!fStates[i].restorable)
 				continue;
+			int changes = fStates[i].changes;
 			if (added == 0) {
 				fList->AddItem(new StateItem(StateItem::kHeading, State(), "Earlier states you can restore", "", "",
 					""));
@@ -929,6 +1002,7 @@ private:
 		fRestore->SetEnabled(!fBusy && picked.size() == 1 && SelectedPlanCanRun());
 		fUndo->SetEnabled(!fBusy && Exists(LastRestoreFile()));
 		fDelete->SetEnabled(!fBusy && !picked.empty());
+		fCleanup->SetEnabled(!fBusy);
 	}
 
 	// the earlier states that are selected (not the current system, not the heading)
@@ -1048,11 +1122,49 @@ private:
 		if (alert->Go() != 1)
 			return;
 
+		StartDeleteJob(std::vector<std::string>(ids.begin(), ids.end()));
+	}
+
+	void StartCleanup()
+	{
+		if (fBusy)
+			return;
+		int kept = 0;
+		std::vector<std::string> ids = CleanupSet(fStates, &kept);
+		if (ids.empty()) {
+			BAlert* none = new BAlert("none", "There are no states to clean up.", "OK", NULL, NULL, B_WIDTH_AS_USUAL,
+				B_INFO_ALERT);
+			none->Go();
+			return;
+		}
+		off_t size = 0;
+		for (size_t i = 0; i < ids.size(); i++)
+			size += StateSize(ids[i]);
+
+		BString question;
+		question << "Delete " << (int)ids.size() << " old " << (ids.size() == 1 ? "state" : "states")
+			<< " that cannot be restored?\n\nThey are the states with package files missing, and the ones that are the "
+			"same as the system now. This frees about " << SizeText(size).c_str()
+			<< ". It cannot be undone.";
+		if (kept > 0) {
+			question << "\n\n" << kept << (kept == 1 ? " is" : " are") << " kept, because a state that can be "
+				"restored needs files in " << (kept == 1 ? "it" : "them") << ".";
+		}
+		question << "\n\nThe states that can be restored, and the system you are running now, are not touched.";
+		BAlert* alert = new BAlert("confirm", question.String(), "Cancel", "Delete", NULL, B_WIDTH_AS_USUAL,
+			B_STOP_ALERT);
+		alert->SetShortcut(0, B_ESCAPE);
+		if (alert->Go() != 1)
+			return;
+		StartDeleteJob(ids);
+	}
+
+	void StartDeleteJob(const std::vector<std::string>& ids)
+	{
 		Job* job = new Job;
 		job->window = BMessenger(this);
 		job->kind = "delete";
-		for (size_t i = 0; i < picked.size(); i++)
-			job->ids.push_back(picked[i]->id);
+		job->ids = ids;
 		fBusy = true;
 		UpdateButtons();
 		SetStatus("Deleting...");
@@ -1118,6 +1230,7 @@ private:
 	BButton*			fRestore;
 	BButton*			fUndo;
 	BButton*			fDelete;
+	BButton*			fCleanup;
 	BButton*			fSyslog;
 	BButton*			fRestart;
 	BStringView*		fStatus;
@@ -1162,7 +1275,7 @@ int
 main(int argc, char** argv)
 {
 	if (argc >= 2) {
-		std::vector<State> states = LoadStates();
+		std::vector<State> states = LoadAllStates();
 		std::string command = argv[1];
 		if (command == "--list") {
 			for (size_t i = 0; i < states.size(); i++) {
@@ -1226,13 +1339,33 @@ main(int argc, char** argv)
 			}
 			return 0;
 		}
+		if (command == "--cleanup") {
+			int kept = 0;
+			std::vector<std::string> ids = CleanupSet(states, &kept);
+			off_t size = 0;
+			for (size_t i = 0; i < ids.size(); i++)
+				size += StateSize(ids[i]);
+			printf("%d states, %s, %d kept because restorable states need their files\n", (int)ids.size(),
+				SizeText(size).c_str(), kept);
+			if (argc >= 3 && strcmp(argv[2], "--dry-run") == 0)
+				return 0;
+			for (size_t i = 0; i < ids.size(); i++) {
+				std::string error = DeleteState(ids[i]);
+				if (!error.empty()) {
+					fprintf(stderr, "%s\n", error.c_str());
+					return 1;
+				}
+			}
+			printf("deleted %d states\n", (int)ids.size());
+			return 0;
+		}
 		if (command == "--syslog") {
 			std::string where;
 			std::string error = SaveSyslog(&where);
 			printf("%s\n", error.empty() ? where.c_str() : error.c_str());
 			return error.empty() ? 0 : 1;
 		}
-		fprintf(stderr, "StateRestore [--list | --plan <state> | --restore <state> [--dry-run] | --undo | --delete <state>... [--dry-run] | --syslog]\n");
+		fprintf(stderr, "StateRestore [--list | --plan <state> | --restore <state> [--dry-run] | --undo | --delete <state>... [--dry-run] | --cleanup [--dry-run] | --syslog]\n");
 		return 1;
 	}
 

@@ -17,6 +17,9 @@ Several earlier states can be selected and deleted with **Delete selected…**, 
 frees and how many other states could not be restored any more (the files of a package are kept in the folder of the state
 that took it out, and an older state can need them). Deleting cannot be undone. The system running now is never touched.
 
+**Delete unrestorable…** deletes the states that cannot be restored (package files missing) or are the same as the system now.
+A state whose folder holds package files that a restorable state needs is kept, and the confirmation says how many.
+
 The window also has **Save syslog to Desktop** (the system log, `listusb`, `listdev`, `uname` and the list of active
 packages, in a folder on the Desktop) and **Restart**.
 
@@ -34,6 +37,7 @@ On Haiku: `make`. It needs `g++` and the Haiku development headers.
     StateRestore --restore <state> [--dry-run]
     StateRestore --undo
     StateRestore --delete <state>... [--dry-run]
+    StateRestore --cleanup [--dry-run]
     StateRestore --syslog
 
 `<state>` is a folder name such as `state_2026-10-15_17:52:34`, or only `2026-10-15_17:52:34`.
