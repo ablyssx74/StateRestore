@@ -1,9 +1,18 @@
 # StateRestore: build on Haiku with `make`, and make the package with `make package`.
 # The one place a release changes is the VERSION file.
 TARGET = StateRestore
-CXX ?= g++
 CXXFLAGS = -Wall -O2 -std=c++11
 LIBS = -lbe
+
+# On 32-bit Haiku the program is built with the newer secondary-architecture compiler, as Cricket is, against the libraries
+# in /boot/system/lib/x86 (the gcc 2 compiler cannot build C++11).
+ifeq ($(shell uname -m), BePC)
+	CXX = g++-x86
+	LDFLAGS = -L/boot/system/lib/x86
+else
+	CXX = g++
+	LDFLAGS =
+endif
 
 VERSION := $(shell sed -n 's/.*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' VERSION | head -1)
 V_MAJOR := $(word 1,$(subst ., ,$(VERSION)))
@@ -17,7 +26,7 @@ PACKAGE = staterestore-$(VERSION)-$(REVISION)-$(ARCH).hpkg
 all: $(TARGET)
 
 $(TARGET): StateRestore.cpp StateRestore.rsrc
-	$(CXX) $(CXXFLAGS) -DSTATERESTORE_VERSION=\"$(VERSION)\" -o $(TARGET) StateRestore.cpp $(LIBS)
+	$(CXX) $(CXXFLAGS) -DSTATERESTORE_VERSION=\"$(VERSION)\" $(LDFLAGS) -o $(TARGET) StateRestore.cpp $(LIBS)
 	xres -o $(TARGET) StateRestore.rsrc
 	mimeset -f $(TARGET)
 

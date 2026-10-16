@@ -28,12 +28,14 @@ Only the system packages are handled, not the ones in `~/config/packages`.
 
 ## Install
 
-Install `staterestore-<version>-1-x86_64.hpkg` from the releases page for the whole system. It adds StateRestore to the
+Install `staterestore-<version>-1-x86_64.hpkg` (64-bit Haiku) or `staterestore-<version>-1-x86_gcc2.hpkg` (32-bit Haiku) from the
+releases page for the whole system. It adds StateRestore to the
 Deskbar's Applications menu, and `StateRestore` to the command line.
 
 ## Build
 
-On Haiku: `make`. It needs `g++` and the Haiku development headers.
+On Haiku: `make`, and `make package` for the package. It needs `g++` and the Haiku development headers. On 32-bit Haiku it builds
+with `g++-x86` (the secondary architecture's compiler), as Cricket does.
 
 ## Command line
 
