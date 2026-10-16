@@ -1,0 +1,904 @@
+/*
+ * StateRestore: go back to an earlier state of the system's packages without the boot menu.
+ *
+ * Haiku keeps an old state of /boot/system as a folder (state_<date>_<time>) with a list of the packages that
+ * were active, and the files of the packages the update removed. Restoring one is a matter of putting the packages
+ * of that state in /boot/system/packages and taking the others out. Nothing is deleted: what is taken out is
+ * kept, so that the restore can be undone.
+ *
+ * Command line (for testing):
+ *   StateRestore --list | --plan <state> | --restore <state> [--dry-run] | --undo
+ */
+
+#include <Alert.h>
+#include <Application.h>
+#include <Button.h>
+#include <Directory.h>
+#include <Entry.h>
+#include <FindDirectory.h>
+#include <fs_info.h>
+#include <LayoutBuilder.h>
+#include <ListView.h>
+#include <Message.h>
+#include <MessageRunner.h>
+#include <Path.h>
+#include <ScrollView.h>
+#include <SplitView.h>
+#include <StringItem.h>
+#include <StringView.h>
+#include <TextView.h>
+#include <Volume.h>
+#include <Window.h>
+
+#include <algorithm>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+
+
+static const char* kAppSignature = "application/x-vnd.ablyss-StateRestore";
+static const char* kPackagesDir = "/boot/system/packages";
+static const char* kAdminDir = "/boot/system/packages/administrative";
+
+typedef std::set<std::string> NameSet;
+
+
+// ---------------------------------------------------------------------------------------------------------------
+// The states
+// ---------------------------------------------------------------------------------------------------------------
+
+struct State {
+	std::string	id;			// the folder's name, state_2026-10-15_17:52:34
+	std::string	label;		// 2026-10-15 17:52:34
+	NameSet		packages;	// what was active in it
+};
+
+
+static bool
+ReadList(const std::string& path, NameSet& out)
+{
+	FILE* file = fopen(path.c_str(), "r");
+	if (file == NULL)
+		return false;
+	char line[2048];
+	while (fgets(line, sizeof(line), file) != NULL) {
+		size_t length = strlen(line);
+		while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r'))
+			line[--length] = '\0';
+		if (length > 0)
+			out.insert(line);
+	}
+	fclose(file);
+	return true;
+}
+
+
+static bool
+Exists(const std::string& path)
+{
+	struct stat st;
+	return stat(path.c_str(), &st) == 0;
+}
+
+
+static std::string
+HoldRoot()
+{
+	BPath path;
+	if (find_directory(B_USER_VAR_DIRECTORY, &path, true) != B_OK)
+		return "/boot/home/config/var/StateRestore";
+	return std::string(path.Path()) + "/StateRestore";
+}
+
+
+static std::string
+LabelOf(const std::string& id)
+{
+	std::string label = id.compare(0, 6, "state_") == 0 ? id.substr(6) : id;
+	size_t underscore = label.find('_');
+	if (underscore != std::string::npos)
+		label[underscore] = ' ';
+	return label;
+}
+
+
+static NameSet
+CurrentPackages()
+{
+	NameSet current;
+	ReadList(std::string(kAdminDir) + "/activated-packages", current);
+	return current;
+}
+
+
+// newest first
+static std::vector<State>
+LoadStates()
+{
+	std::vector<State> states;
+	DIR* dir = opendir(kAdminDir);
+	if (dir == NULL)
+		return states;
+	while (struct dirent* entry = readdir(dir)) {
+		if (strncmp(entry->d_name, "state_", 6) != 0)
+			continue;
+		State state;
+		state.id = entry->d_name;
+		state.label = LabelOf(state.id);
+		if (!ReadList(std::string(kAdminDir) + "/" + state.id + "/activated-packages", state.packages))
+			continue;
+		states.push_back(state);
+	}
+	closedir(dir);
+	std::sort(states.begin(), states.end(), [](const State& a, const State& b) { return a.id > b.id; });
+	return states;
+}
+
+
+// The name of a package without its version: haiku-r1~beta6_hrev60237-1-x86_64.hpkg is "haiku".
+static std::string
+BaseName(const std::string& file)
+{
+	size_t dash = file.find('-');
+	return dash == std::string::npos ? file : file.substr(0, dash);
+}
+
+
+static std::string
+VersionOf(const std::string& file)
+{
+	std::string base = BaseName(file);
+	std::string rest = file.size() > base.size() + 1 ? file.substr(base.size() + 1) : file;
+	size_t end = rest.rfind(".hpkg");
+	if (end != std::string::npos)
+		rest.resize(end);
+	return rest;
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------
+// What a restore would do
+// ---------------------------------------------------------------------------------------------------------------
+
+struct Plan {
+	std::vector<std::string>				remove;		// active now, not in the state
+	std::vector<std::string>				add;		// in the state, not active now
+	std::map<std::string, std::string>		source;		// where the file of each of those is
+	std::vector<std::string>				missing;	// ... and the ones that are nowhere
+	std::string								error;
+};
+
+
+// A package file of an earlier state: in the packages folder, in the folder of a state that removed it, or in the
+// ones kept by an earlier restore.
+static std::string
+FindPackageFile(const std::string& name, const std::vector<State>& states)
+{
+	std::string path = std::string(kPackagesDir) + "/" + name;
+	if (Exists(path))
+		return path;
+	for (size_t i = 0; i < states.size(); i++) {
+		path = std::string(kAdminDir) + "/" + states[i].id + "/" + name;
+		if (Exists(path))
+			return path;
+	}
+	std::string held = HoldRoot() + "/held";
+	if (DIR* dir = opendir(held.c_str())) {
+		while (struct dirent* entry = readdir(dir)) {
+			if (entry->d_name[0] == '.')
+				continue;
+			path = held + "/" + entry->d_name + "/" + name;
+			if (Exists(path)) {
+				closedir(dir);
+				return path;
+			}
+		}
+		closedir(dir);
+	}
+	return "";
+}
+
+
+static Plan
+MakePlan(const State& target, const std::vector<State>& states)
+{
+	Plan plan;
+	NameSet current = CurrentPackages();
+	if (current.empty()) {
+		plan.error = "The list of active packages could not be read.";
+		return plan;
+	}
+	for (NameSet::const_iterator it = current.begin(); it != current.end(); ++it) {
+		if (target.packages.count(*it) == 0)
+			plan.remove.push_back(*it);
+	}
+	for (NameSet::const_iterator it = target.packages.begin(); it != target.packages.end(); ++it) {
+		if (current.count(*it) != 0)
+			continue;
+		plan.add.push_back(*it);
+		std::string path = FindPackageFile(*it, states);
+		if (path.empty())
+			plan.missing.push_back(*it);
+		else
+			plan.source[*it] = path;
+	}
+	return plan;
+}
+
+
+// "haiku: r1~beta6_hrev60256-1-x86_64 -> r1~beta6_hrev60237-1-x86_64", for what is only a version change, and the rest
+// as removed or restored.
+static std::string
+DescribePlan(const Plan& plan)
+{
+	std::string text;
+	if (!plan.error.empty())
+		return plan.error + "\n";
+
+	std::map<std::string, std::string> removedByBase, addedByBase;
+	for (size_t i = 0; i < plan.remove.size(); i++)
+		removedByBase[BaseName(plan.remove[i])] = plan.remove[i];
+	for (size_t i = 0; i < plan.add.size(); i++)
+		addedByBase[BaseName(plan.add[i])] = plan.add[i];
+
+	std::string changed, removed, restored;
+	for (std::map<std::string, std::string>::const_iterator it = removedByBase.begin(); it != removedByBase.end(); ++it) {
+		std::map<std::string, std::string>::const_iterator other = addedByBase.find(it->first);
+		if (other != addedByBase.end())
+			changed += "  " + it->first + ":  " + VersionOf(it->second) + "  ->  " + VersionOf(other->second) + "\n";
+		else
+			removed += "  " + it->second + "\n";
+	}
+	for (std::map<std::string, std::string>::const_iterator it = addedByBase.begin(); it != addedByBase.end(); ++it) {
+		if (removedByBase.find(it->first) == removedByBase.end())
+			restored += "  " + it->second + "\n";
+	}
+
+	if (changed.empty() && removed.empty() && restored.empty())
+		return "This is the state the system is in now. Nothing would change.\n";
+	if (!changed.empty())
+		text += "Packages that change version:\n" + changed + "\n";
+	if (!removed.empty())
+		text += "Packages that are taken out (kept, so that the restore can be undone):\n" + removed + "\n";
+	if (!restored.empty())
+		text += "Packages that are put back:\n" + restored + "\n";
+	if (!plan.missing.empty()) {
+		text += "These files cannot be found, so this state cannot be restored:\n";
+		for (size_t i = 0; i < plan.missing.size(); i++)
+			text += "  " + plan.missing[i] + "\n";
+	}
+	return text;
+}
+
+
+static int
+ChangeCount(const Plan& plan)
+{
+	std::set<std::string> bases;
+	for (size_t i = 0; i < plan.remove.size(); i++)
+		bases.insert(BaseName(plan.remove[i]));
+	for (size_t i = 0; i < plan.add.size(); i++)
+		bases.insert(BaseName(plan.add[i]));
+	return (int)bases.size();
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------
+// Doing it
+// ---------------------------------------------------------------------------------------------------------------
+
+static bool
+CopyFile(const std::string& from, const std::string& to, std::string& error)
+{
+	int in = open(from.c_str(), O_RDONLY);
+	if (in < 0) {
+		error = "Cannot read " + from + ": " + strerror(errno);
+		return false;
+	}
+	int out = open(to.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (out < 0) {
+		error = "Cannot write " + to + ": " + strerror(errno);
+		close(in);
+		return false;
+	}
+	static const size_t kBuffer = 1024 * 1024;
+	char* buffer = (char*)malloc(kBuffer);
+	off_t total = 0;
+	bool ok = true;
+	for (;;) {
+		ssize_t got = read(in, buffer, kBuffer);
+		if (got < 0) {
+			error = "Reading " + from + " failed: " + strerror(errno);
+			ok = false;
+			break;
+		}
+		if (got == 0)
+			break;
+		ssize_t put = write(out, buffer, got);
+		if (put != got) {
+			error = "Writing " + to + " failed: " + strerror(errno);
+			ok = false;
+			break;
+		}
+		total += got;
+	}
+	free(buffer);
+	close(in);
+	if (ok && fsync(out) != 0 && errno != EINVAL && errno != ENOSYS) {
+		error = "Writing " + to + " failed: " + strerror(errno);
+		ok = false;
+	}
+	close(out);
+	struct stat st;
+	if (ok && (stat(from.c_str(), &st) != 0 || st.st_size != total)) {
+		error = "The copy of " + from + " is not complete.";
+		ok = false;
+	}
+	if (!ok)
+		unlink(to.c_str());
+	return ok;
+}
+
+
+static bool
+WriteLines(const std::string& path, const std::vector<std::string>& lines)
+{
+	FILE* file = fopen(path.c_str(), "w");
+	if (file == NULL)
+		return false;
+	for (size_t i = 0; i < lines.size(); i++)
+		fprintf(file, "%s\n", lines[i].c_str());
+	fclose(file);
+	return true;
+}
+
+
+static std::string
+Timestamp()
+{
+	char text[32];
+	time_t now = time(NULL);
+	struct tm local;
+	localtime_r(&now, &local);
+	strftime(text, sizeof(text), "%Y%m%d-%H%M%S", &local);
+	return text;
+}
+
+
+static std::string
+LastRestoreFile()
+{
+	return HoldRoot() + "/last-restore";
+}
+
+
+// Returns an empty string when it went well, otherwise what went wrong.
+static std::string
+Restore(const State& target, const std::vector<State>& states, bool dryRun, std::string* report)
+{
+	Plan plan = MakePlan(target, states);
+	if (report != NULL)
+		*report = DescribePlan(plan);
+	if (!plan.error.empty())
+		return plan.error;
+	if (!plan.missing.empty())
+		return "Some package files of that state are gone, so it cannot be restored.";
+	if (plan.remove.empty() && plan.add.empty())
+		return "That is the state the system is in now.";
+	if (dryRun)
+		return "";
+
+	// room for the copies
+	off_t needed = 0;
+	for (std::map<std::string, std::string>::const_iterator it = plan.source.begin(); it != plan.source.end(); ++it) {
+		struct stat st;
+		if (stat(it->second.c_str(), &st) == 0)
+			needed += st.st_size;
+	}
+	BVolume volume(dev_for_path(kPackagesDir));
+	if (volume.InitCheck() == B_OK && volume.FreeBytes() < needed + 64 * 1024 * 1024)
+		return "There is not enough free space on the boot disk.";
+
+	std::string holdDir = HoldRoot() + "/held/" + Timestamp();
+	if (create_directory((HoldRoot() + "/held").c_str(), 0755) != B_OK || create_directory(holdDir.c_str(), 0755) != B_OK)
+		return "Cannot make the folder for the packages that are taken out.";
+
+	// 1. the packages to put back are copied next to the others under a name the system ignores
+	std::string error;
+	std::vector<std::string> staged;
+	for (size_t i = 0; i < plan.add.size(); i++) {
+		std::string staging = std::string(kPackagesDir) + "/" + plan.add[i] + ".stage";
+		if (!CopyFile(plan.source[plan.add[i]], staging, error)) {
+			for (size_t j = 0; j < staged.size(); j++)
+				unlink(staged[j].c_str());
+			return error;
+		}
+		staged.push_back(staging);
+	}
+
+	// 2. the swap, quickly, so that the system is without a package for as short a time as it can be
+	std::vector<std::string> taken;
+	for (size_t i = 0; i < plan.remove.size(); i++) {
+		std::string from = std::string(kPackagesDir) + "/" + plan.remove[i];
+		if (rename(from.c_str(), (holdDir + "/" + plan.remove[i]).c_str()) != 0) {
+			error = "Cannot take out " + plan.remove[i] + ": " + strerror(errno);
+			// put back what was taken out, and clean up
+			for (size_t j = 0; j < taken.size(); j++)
+				rename((holdDir + "/" + taken[j]).c_str(), (std::string(kPackagesDir) + "/" + taken[j]).c_str());
+			for (size_t j = 0; j < staged.size(); j++)
+				unlink(staged[j].c_str());
+			return error;
+		}
+		taken.push_back(plan.remove[i]);
+	}
+	for (size_t i = 0; i < plan.add.size(); i++) {
+		std::string to = std::string(kPackagesDir) + "/" + plan.add[i];
+		if (rename(staged[i].c_str(), to.c_str()) != 0)
+			error = "Cannot put in " + plan.add[i] + ": " + strerror(errno);
+	}
+
+	WriteLines(holdDir + "/removed.txt", plan.remove);
+	WriteLines(holdDir + "/added.txt", plan.add);
+	WriteLines(LastRestoreFile(), std::vector<std::string>(1, holdDir));
+	if (report != NULL)
+		*report = DescribePlan(plan);
+	return error;
+}
+
+
+static std::string
+Undo(std::string* report)
+{
+	NameSet last;
+	if (!ReadList(LastRestoreFile(), last) || last.empty())
+		return "There is no restore to undo.";
+	std::string holdDir = *last.begin();
+	NameSet removed, added;
+	if (!ReadList(holdDir + "/removed.txt", removed) || !ReadList(holdDir + "/added.txt", added))
+		return "The record of the last restore is not complete.";
+
+	for (NameSet::const_iterator it = removed.begin(); it != removed.end(); ++it) {
+		if (!Exists(holdDir + "/" + *it))
+			return "The kept package " + *it + " is gone, so the restore cannot be undone.";
+	}
+
+	// the kept packages are put next to the others, then the swap back
+	std::string undoneDir = holdDir + "/undone";
+	create_directory(undoneDir.c_str(), 0755);
+	for (NameSet::const_iterator it = removed.begin(); it != removed.end(); ++it)
+		rename((holdDir + "/" + *it).c_str(), (std::string(kPackagesDir) + "/" + *it + ".stage").c_str());
+	for (NameSet::const_iterator it = added.begin(); it != added.end(); ++it)
+		rename((std::string(kPackagesDir) + "/" + *it).c_str(), (undoneDir + "/" + *it).c_str());
+	for (NameSet::const_iterator it = removed.begin(); it != removed.end(); ++it) {
+		std::string to = std::string(kPackagesDir) + "/" + *it;
+		rename((to + ".stage").c_str(), to.c_str());
+	}
+	unlink(LastRestoreFile().c_str());
+	if (report != NULL)
+		*report = "The restore of " + holdDir + " is undone.";
+	return "";
+}
+
+
+// Copies the system log and a few facts to a folder on the Desktop, for sending to someone.
+static std::string
+SaveSyslog(std::string* where)
+{
+	BPath desktop;
+	if (find_directory(B_DESKTOP_DIRECTORY, &desktop, true) != B_OK)
+		return "Cannot find the Desktop.";
+	std::string folder = std::string(desktop.Path()) + "/syslog-" + Timestamp();
+	if (create_directory(folder.c_str(), 0755) != B_OK)
+		return "Cannot make " + folder;
+	std::string error;
+	const char* logs[] = { "/var/log/syslog", "/var/log/syslog.old", "/var/log/syslog.1" };
+	for (size_t i = 0; i < sizeof(logs) / sizeof(logs[0]); i++) {
+		if (Exists(logs[i]))
+			CopyFile(logs[i], folder + "/" + (strrchr(logs[i], '/') + 1) + ".txt", error);
+	}
+	std::string command = "(uname -a; echo; listusb; echo; listdev) > '" + folder + "/system-info.txt' 2>&1";
+	system(command.c_str());
+	CopyFile(std::string(kAdminDir) + "/activated-packages", folder + "/activated-packages.txt", error);
+	if (where != NULL)
+		*where = folder;
+	return "";
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------
+// The window
+// ---------------------------------------------------------------------------------------------------------------
+
+enum {
+	kMsgSelected	= 'sel!',
+	kMsgRestore		= 'rst!',
+	kMsgUndo		= 'und!',
+	kMsgSyslog		= 'log!',
+	kMsgRestart		= 'rbt!',
+	kMsgRefresh		= 'rfr!',
+	kMsgWorkDone	= 'wrk!'
+};
+
+
+struct Job {
+	BMessenger		window;
+	std::string		kind;		// "restore" or "undo"
+	State			target;
+	std::vector<State> states;
+};
+
+
+static int32
+RunJob(void* data)
+{
+	Job* job = (Job*)data;
+	std::string report;
+	std::string error;
+	if (job->kind == "restore")
+		error = Restore(job->target, job->states, false, &report);
+	else
+		error = Undo(&report);
+	BMessage done(kMsgWorkDone);
+	done.AddString("kind", job->kind.c_str());
+	done.AddString("error", error.c_str());
+	done.AddString("report", report.c_str());
+	job->window.SendMessage(&done);
+	delete job;
+	return 0;
+}
+
+
+class StateItem : public BStringItem {
+public:
+	StateItem(const State& state, int changes)
+		:
+		BStringItem(""),
+		fState(state)
+	{
+		BString text(state.label.c_str());
+		text << "    " << changes << (changes == 1 ? " package differs" : " packages differ");
+		SetText(text.String());
+	}
+
+	const State& GetState() const { return fState; }
+
+private:
+	State fState;
+};
+
+
+class StateWindow : public BWindow {
+public:
+	StateWindow()
+		:
+		BWindow(BRect(100, 100, 760, 520), "State Restore", B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS),
+		fBusy(false),
+		fRefreshRunner(NULL)
+	{
+		BStringView* intro = new BStringView("intro",
+			"Go back to an earlier state of the system's packages, without the boot menu.");
+		BStringView* hint = new BStringView("hint",
+			"Nothing is deleted. Restart afterwards for the old system to start.");
+		hint->SetHighColor(tint_color(ui_color(B_PANEL_TEXT_COLOR), B_LIGHTEN_1_TINT));
+
+		fList = new BListView("states");
+		fList->SetSelectionMessage(new BMessage(kMsgSelected));
+		BScrollView* listScroll = new BScrollView("listScroll", fList, 0, false, true);
+
+		fPreview = new BTextView("preview");
+		fPreview->MakeEditable(false);
+		fPreview->SetWordWrap(true);
+		BScrollView* previewScroll = new BScrollView("previewScroll", fPreview, 0, false, true);
+
+		fRestore = new BButton("restore", "Restore selected state" B_UTF8_ELLIPSIS, new BMessage(kMsgRestore));
+		fUndo = new BButton("undo", "Undo last restore", new BMessage(kMsgUndo));
+		fSyslog = new BButton("syslog", "Save syslog to Desktop", new BMessage(kMsgSyslog));
+		fRestart = new BButton("restart", "Restart" B_UTF8_ELLIPSIS, new BMessage(kMsgRestart));
+		fStatus = new BStringView("status", "");
+
+		listScroll->SetExplicitMinSize(BSize(330, 200));
+		listScroll->SetExplicitPreferredSize(BSize(380, 300));
+		previewScroll->SetExplicitMinSize(BSize(300, 200));
+		previewScroll->SetExplicitPreferredSize(BSize(420, 300));
+		BSplitView* split = new BSplitView(B_HORIZONTAL);
+		split->AddChild(listScroll, 0.42f);
+		split->AddChild(previewScroll, 0.58f);
+
+		BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_DEFAULT_SPACING)
+			.SetInsets(B_USE_WINDOW_INSETS)
+			.Add(intro)
+			.Add(hint)
+			.Add(split)
+			.AddGroup(B_HORIZONTAL)
+				.Add(fRestore)
+				.Add(fUndo)
+				.Add(fSyslog)
+				.AddGlue()
+				.Add(fRestart)
+			.End()
+			.Add(fStatus);
+
+		Reload();
+	}
+
+	bool QuitRequested()
+	{
+		be_app->PostMessage(B_QUIT_REQUESTED);
+		return true;
+	}
+
+	void MessageReceived(BMessage* message)
+	{
+		switch (message->what) {
+			case kMsgSelected:
+				ShowPreview();
+				break;
+			case kMsgRestore:
+				StartRestore();
+				break;
+			case kMsgUndo:
+				StartUndo();
+				break;
+			case kMsgSyslog:
+			{
+				std::string where;
+				std::string error = SaveSyslog(&where);
+				if (error.empty())
+					SetStatus(("Saved on the Desktop: " + where).c_str());
+				else
+					SetStatus(error.c_str());
+				break;
+			}
+			case kMsgRestart:
+			{
+				BAlert* alert = new BAlert("restart", "Restart the computer now?", "Not now", "Restart", NULL,
+					B_WIDTH_AS_USUAL, B_WARNING_ALERT);
+				alert->SetShortcut(0, B_ESCAPE);
+				if (alert->Go() == 1)
+					system("shutdown -r &");
+				break;
+			}
+			case kMsgRefresh:
+				Reload();
+				break;
+			case kMsgWorkDone:
+				WorkDone(message);
+				break;
+			default:
+				BWindow::MessageReceived(message);
+		}
+	}
+
+private:
+	void SetStatus(const char* text)
+	{
+		fStatus->SetText(text);
+	}
+
+	void Reload()
+	{
+		fStates = LoadStates();
+		fList->MakeEmpty();
+		// the states that have the packages the system has now are of no use, so they are left out
+		for (size_t i = 0; i < fStates.size(); i++) {
+			Plan plan = MakePlan(fStates[i], fStates);
+			int changes = ChangeCount(plan);
+			if (changes == 0)
+				continue;
+			fList->AddItem(new StateItem(fStates[i], changes));
+		}
+		fPreview->SetText(fList->CountItems() > 0 ? "Pick a state on the left to see what a restore would change."
+			: "There is no earlier state that differs from the system now.");
+		fUndo->SetEnabled(Exists(LastRestoreFile()));
+		fRestore->SetEnabled(false);
+		UpdateButtons();
+	}
+
+	void UpdateButtons()
+	{
+		fRestore->SetEnabled(!fBusy && fList->CurrentSelection() >= 0 && SelectedPlanCanRun());
+		fUndo->SetEnabled(!fBusy && Exists(LastRestoreFile()));
+	}
+
+	const State* Selected() const
+	{
+		StateItem* item = dynamic_cast<StateItem*>(fList->ItemAt(fList->CurrentSelection()));
+		return item != NULL ? &item->GetState() : NULL;
+	}
+
+	bool SelectedPlanCanRun() const
+	{
+		const State* state = Selected();
+		if (state == NULL)
+			return false;
+		Plan plan = MakePlan(*state, fStates);
+		return plan.error.empty() && plan.missing.empty() && (!plan.remove.empty() || !plan.add.empty());
+	}
+
+	void ShowPreview()
+	{
+		const State* state = Selected();
+		if (state == NULL) {
+			UpdateButtons();
+			return;
+		}
+		Plan plan = MakePlan(*state, fStates);
+		std::string text = "State of " + state->label + "\n\n" + DescribePlan(plan);
+		fPreview->SetText(text.c_str());
+		UpdateButtons();
+	}
+
+	void StartRestore()
+	{
+		const State* state = Selected();
+		if (state == NULL || fBusy)
+			return;
+		BString question("Go back to the state of ");
+		question << state->label.c_str() << "?\n\nThe packages that differ are swapped. They are kept, and Undo puts "
+			"them back. You restart afterwards.";
+		BAlert* alert = new BAlert("confirm", question.String(), "Cancel", "Restore", NULL, B_WIDTH_AS_USUAL,
+			B_WARNING_ALERT);
+		alert->SetShortcut(0, B_ESCAPE);
+		if (alert->Go() != 1)
+			return;
+		Start("restore", *state);
+	}
+
+	void StartUndo()
+	{
+		if (fBusy)
+			return;
+		BAlert* alert = new BAlert("confirm", "Undo the last restore?\n\nThe packages that were taken out come back.",
+			"Cancel", "Undo", NULL, B_WIDTH_AS_USUAL, B_WARNING_ALERT);
+		alert->SetShortcut(0, B_ESCAPE);
+		if (alert->Go() != 1)
+			return;
+		Start("undo", State());
+	}
+
+	void Start(const char* kind, const State& state)
+	{
+		Job* job = new Job;
+		job->window = BMessenger(this);
+		job->kind = kind;
+		job->target = state;
+		job->states = fStates;
+		fBusy = true;
+		UpdateButtons();
+		SetStatus(strcmp(kind, "restore") == 0 ? "Swapping the packages..." : "Putting the packages back...");
+		thread_id thread = spawn_thread(RunJob, "state restore", B_NORMAL_PRIORITY, job);
+		resume_thread(thread);
+	}
+
+	void WorkDone(BMessage* message)
+	{
+		fBusy = false;
+		BString error = message->GetString("error", "");
+		BString report = message->GetString("report", "");
+		BString kind = message->GetString("kind", "");
+		if (error.Length() > 0) {
+			SetStatus(error.String());
+			BAlert* alert = new BAlert("error", error.String(), "OK", NULL, NULL, B_WIDTH_AS_USUAL, B_STOP_ALERT);
+			alert->Go();
+		} else {
+			SetStatus(kind == "restore"
+				? "Done. The system has the packages of that state; restart for it to start."
+				: "Done. The packages of before the restore are back; restart for it to take effect.");
+		}
+		// the system takes a few seconds to write its record of the change
+		BMessage refresh(kMsgRefresh);
+		delete fRefreshRunner;
+		fRefreshRunner = new BMessageRunner(this, &refresh, 4000000, 1);
+		Reload();
+		if (report.Length() > 0)
+			fPreview->SetText(report.String());
+	}
+
+	BListView*			fList;
+	BTextView*			fPreview;
+	BButton*			fRestore;
+	BButton*			fUndo;
+	BButton*			fSyslog;
+	BButton*			fRestart;
+	BStringView*		fStatus;
+	std::vector<State>	fStates;
+	bool				fBusy;
+	BMessageRunner*		fRefreshRunner;
+};
+
+
+class StateApp : public BApplication {
+public:
+	StateApp()
+		:
+		BApplication(kAppSignature)
+	{
+	}
+
+	void ReadyToRun()
+	{
+		(new StateWindow())->Show();
+	}
+};
+
+
+// ---------------------------------------------------------------------------------------------------------------
+
+static const State*
+FindState(const std::vector<State>& states, const char* id)
+{
+	std::string wanted = id;
+	if (wanted.compare(0, 6, "state_") != 0)
+		wanted = "state_" + wanted;
+	for (size_t i = 0; i < states.size(); i++) {
+		if (states[i].id == wanted)
+			return &states[i];
+	}
+	return NULL;
+}
+
+
+int
+main(int argc, char** argv)
+{
+	if (argc >= 2) {
+		std::vector<State> states = LoadStates();
+		std::string command = argv[1];
+		if (command == "--list") {
+			for (size_t i = 0; i < states.size(); i++) {
+				Plan plan = MakePlan(states[i], states);
+				printf("%s  %d differ%s\n", states[i].id.c_str(), ChangeCount(plan), plan.missing.empty() ? "" : "  (files missing)");
+			}
+			return 0;
+		}
+		if ((command == "--plan" || command == "--restore") && argc >= 3) {
+			const State* state = FindState(states, argv[2]);
+			if (state == NULL) {
+				fprintf(stderr, "No such state.\n");
+				return 1;
+			}
+			bool dryRun = command == "--plan" || (argc >= 4 && strcmp(argv[3], "--dry-run") == 0);
+			std::string report;
+			std::string error = Restore(*state, states, dryRun, &report);
+			printf("%s", report.c_str());
+			if (!error.empty()) {
+				fprintf(stderr, "%s\n", error.c_str());
+				return 1;
+			}
+			return 0;
+		}
+		if (command == "--undo") {
+			std::string report;
+			std::string error = Undo(&report);
+			printf("%s\n", report.c_str());
+			if (!error.empty()) {
+				fprintf(stderr, "%s\n", error.c_str());
+				return 1;
+			}
+			return 0;
+		}
+		if (command == "--syslog") {
+			std::string where;
+			std::string error = SaveSyslog(&where);
+			printf("%s\n", error.empty() ? where.c_str() : error.c_str());
+			return error.empty() ? 0 : 1;
+		}
+		fprintf(stderr, "StateRestore [--list | --plan <state> | --restore <state> [--dry-run] | --undo | --syslog]\n");
+		return 1;
+	}
+
+	StateApp app;
+	app.Run();
+	return 0;
+}
