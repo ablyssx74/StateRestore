@@ -24,6 +24,7 @@
 #include <Path.h>
 #include <ScrollView.h>
 #include <SplitView.h>
+#include <ListItem.h>
 #include <StringItem.h>
 #include <StringView.h>
 #include <TextView.h>
@@ -164,6 +165,25 @@ VersionOf(const std::string& file)
 	if (end != std::string::npos)
 		rest.resize(end);
 	return rest;
+}
+
+
+// "hrev60237", from the haiku package of a state ("" when it has none)
+static std::string
+HaikuRevision(const NameSet& packages)
+{
+	for (NameSet::const_iterator it = packages.begin(); it != packages.end(); ++it) {
+		if (BaseName(*it) != "haiku")
+			continue;
+		size_t at = it->find("hrev");
+		if (at == std::string::npos)
+			return "";
+		size_t end = at + 4;
+		while (end < it->size() && (*it)[end] >= '0' && (*it)[end] <= '9')
+			end++;
+		return it->substr(at, end - at);
+	}
+	return "";
 }
 
 
@@ -559,22 +579,90 @@ RunJob(void* data)
 }
 
 
-class StateItem : public BStringItem {
+// A row of the list: the current system (bold, on a tinted background), a heading, or an earlier state that can be
+// restored. The columns are the date, the Haiku revision and what differs from now.
+class StateItem : public BListItem {
 public:
-	StateItem(const State& state, int changes)
+	enum Kind { kCurrent, kHeading, kState };
+
+	StateItem(Kind kind, const State& state, const BString& date, const BString& revision, const BString& detail,
+		const BString& tag)
 		:
-		BStringItem(""),
-		fState(state)
+		BListItem(),
+		fKind(kind),
+		fState(state),
+		fDate(date),
+		fRevision(revision),
+		fDetail(detail),
+		fTag(tag)
 	{
-		BString text(state.label.c_str());
-		text << "    " << changes << (changes == 1 ? " package differs" : " packages differ");
-		SetText(text.String());
+		SetEnabled(kind != kHeading);
 	}
 
+	Kind GetKind() const { return fKind; }
 	const State& GetState() const { return fState; }
 
+	void Update(BView* owner, const BFont* font)
+	{
+		BListItem::Update(owner, font);
+		font_height height;
+		font->GetHeight(&height);
+		SetHeight(ceilf(height.ascent + height.descent + height.leading) + 8);
+		fAscent = height.ascent;
+	}
+
+	void DrawItem(BView* owner, BRect frame, bool complete)
+	{
+		rgb_color background = ui_color(B_LIST_BACKGROUND_COLOR);
+		rgb_color text = ui_color(B_LIST_ITEM_TEXT_COLOR);
+		if (fKind == kCurrent)
+			background = tint_color(ui_color(B_CONTROL_HIGHLIGHT_COLOR), 1.6f);
+		if (IsSelected()) {
+			background = ui_color(B_LIST_SELECTED_BACKGROUND_COLOR);
+			text = ui_color(B_LIST_SELECTED_ITEM_TEXT_COLOR);
+		} else if (fKind == kCurrent) {
+			text = ui_color(B_LIST_ITEM_TEXT_COLOR);
+		}
+		owner->SetHighColor(background);
+		owner->FillRect(frame);
+
+		BFont font;
+		owner->GetFont(&font);
+		BFont bold(font);
+		bold.SetFace(B_BOLD_FACE);
+		float baseline = frame.top + 4 + fAscent;
+
+		if (fKind == kHeading) {
+			owner->SetFont(&bold);
+			owner->SetHighColor(tint_color(ui_color(B_LIST_ITEM_TEXT_COLOR), B_LIGHTEN_1_TINT));
+			owner->DrawString(fDate.String(), BPoint(frame.left + 6, baseline));
+			owner->SetFont(&font);
+			return;
+		}
+
+		// the tag, the date, the Haiku revision and what differs, in columns
+		float x = frame.left + 6;
+		if (fTag.Length() > 0) {
+			owner->SetFont(&bold);
+			owner->SetHighColor(IsSelected() ? text : tint_color(ui_color(B_CONTROL_HIGHLIGHT_COLOR), 0.7f));
+			owner->DrawString(fTag.String(), BPoint(x, baseline));
+		}
+		x += bold.StringWidth("PREVIOUS") + 16;
+		owner->SetHighColor(text);
+		owner->SetFont(fKind == kCurrent ? &bold : &font);
+		owner->DrawString(fDate.String(), BPoint(x, baseline));
+		x += font.StringWidth("2026-10-16 13:25:27") + 20;
+		owner->DrawString(fRevision.String(), BPoint(x, baseline));
+		x += font.StringWidth("hrev00000") + 20;
+		owner->DrawString(fDetail.String(), BPoint(x, baseline));
+		owner->SetFont(&font);
+	}
+
 private:
-	State fState;
+	Kind	fKind;
+	State	fState;
+	BString	fDate, fRevision, fDetail, fTag;
+	float	fAscent;
 };
 
 
@@ -607,10 +695,10 @@ public:
 		fRestart = new BButton("restart", "Restart" B_UTF8_ELLIPSIS, new BMessage(kMsgRestart));
 		fStatus = new BStringView("status", "");
 
-		listScroll->SetExplicitMinSize(BSize(330, 200));
-		listScroll->SetExplicitPreferredSize(BSize(380, 300));
-		previewScroll->SetExplicitMinSize(BSize(300, 200));
-		previewScroll->SetExplicitPreferredSize(BSize(420, 300));
+		listScroll->SetExplicitMinSize(BSize(540, 200));
+		listScroll->SetExplicitPreferredSize(BSize(560, 320));
+		previewScroll->SetExplicitMinSize(BSize(260, 200));
+		previewScroll->SetExplicitPreferredSize(BSize(320, 320));
 		BSplitView* split = new BSplitView(B_HORIZONTAL);
 		split->AddChild(listScroll, 0.42f);
 		split->AddChild(previewScroll, 0.58f);
@@ -690,17 +778,48 @@ private:
 	{
 		fStates = LoadStates();
 		fList->MakeEmpty();
-		// the states that have the packages the system has now are of no use, so they are left out
+
+		NameSet current = CurrentPackages();
+		BString since;
+		struct stat st;
+		if (stat((std::string(kAdminDir) + "/activated-packages").c_str(), &st) == 0) {
+			char text[32];
+			struct tm local;
+			localtime_r(&st.st_mtime, &local);
+			strftime(text, sizeof(text), "%Y-%m-%d %H:%M:%S", &local);
+			since = text;
+		}
+		BString revision(HaikuRevision(current).c_str());
+		State nowState;
+		nowState.id = "";
+		nowState.packages = current;
+		BString detail;
+		detail << (int)current.size() << " packages";
+		fList->AddItem(new StateItem(StateItem::kCurrent, nowState, since, revision, detail, "CURRENT"));
+
+		// only the states that can be restored: they have what the system has not, and all of their files are there
+		int added = 0;
 		for (size_t i = 0; i < fStates.size(); i++) {
 			Plan plan = MakePlan(fStates[i], fStates);
 			int changes = ChangeCount(plan);
-			if (changes == 0)
+			if (changes == 0 || !plan.missing.empty() || !plan.error.empty())
 				continue;
-			fList->AddItem(new StateItem(fStates[i], changes));
+			if (added == 0) {
+				fList->AddItem(new StateItem(StateItem::kHeading, State(), "Earlier states you can restore", "", "",
+					""));
+			}
+			BString text;
+			text << changes << (changes == 1 ? " package differs" : " packages differ");
+			BString rev(HaikuRevision(fStates[i].packages).c_str());
+			// a state with another Haiku than the one running is marked as older or newer
+			BString tag(added == 0 ? "PREVIOUS" : "");
+			if (rev.Length() > 4 && revision.Length() > 4 && rev != revision)
+				tag = atol(rev.String() + 4) < atol(revision.String() + 4) ? "OLDER" : "NEWER";
+			fList->AddItem(new StateItem(StateItem::kState, fStates[i], fStates[i].label.c_str(), rev, text, tag));
+			added++;
 		}
-		fPreview->SetText(fList->CountItems() > 0 ? "Pick a state on the left to see what a restore would change."
-			: "There is no earlier state that differs from the system now.");
-		fUndo->SetEnabled(Exists(LastRestoreFile()));
+		fPreview->SetText(added > 0 ? "Pick a state on the left to see what a restore would change."
+			: "There is no earlier state that can be restored.");
 		fRestore->SetEnabled(false);
 		UpdateButtons();
 	}
@@ -714,7 +833,7 @@ private:
 	const State* Selected() const
 	{
 		StateItem* item = dynamic_cast<StateItem*>(fList->ItemAt(fList->CurrentSelection()));
-		return item != NULL ? &item->GetState() : NULL;
+		return item != NULL && item->GetKind() == StateItem::kState ? &item->GetState() : NULL;
 	}
 
 	bool SelectedPlanCanRun() const
@@ -728,6 +847,13 @@ private:
 
 	void ShowPreview()
 	{
+		StateItem* picked = dynamic_cast<StateItem*>(fList->ItemAt(fList->CurrentSelection()));
+		if (picked != NULL && picked->GetKind() == StateItem::kCurrent) {
+			fPreview->SetText("This is the system you are running now.\n\nPick one of the earlier states to see "
+				"what going back to it would change.");
+			UpdateButtons();
+			return;
+		}
 		const State* state = Selected();
 		if (state == NULL) {
 			UpdateButtons();
