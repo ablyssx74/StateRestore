@@ -13,6 +13,10 @@ are looked for when an earlier state needs them again.
 Restart afterwards: the kernel and the system libraries come from the `haiku` package, so a restore of it starts with
 the next boot.
 
+Several earlier states can be selected and deleted with **Delete selected…**, after a confirmation that says how much space it
+frees and how many other states could not be restored any more (the files of a package are kept in the folder of the state
+that took it out, and an older state can need them). Deleting cannot be undone. The system running now is never touched.
+
 The window also has **Save syslog to Desktop** (the system log, `listusb`, `listdev`, `uname` and the list of active
 packages, in a folder on the Desktop) and **Restart**.
 
@@ -29,6 +33,7 @@ On Haiku: `make`. It needs `g++` and the Haiku development headers.
     StateRestore --plan <state>               what a restore would do
     StateRestore --restore <state> [--dry-run]
     StateRestore --undo
+    StateRestore --delete <state>... [--dry-run]
     StateRestore --syslog
 
 `<state>` is a folder name such as `state_2026-10-15_17:52:34`, or only `2026-10-15_17:52:34`.

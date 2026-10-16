@@ -536,6 +536,85 @@ SaveSyslog(std::string* where)
 }
 
 
+// The size of the files in the folder of a state.
+static off_t
+StateSize(const std::string& id)
+{
+	off_t total = 0;
+	std::string folder = std::string(kAdminDir) + "/" + id;
+	if (DIR* dir = opendir(folder.c_str())) {
+		while (struct dirent* entry = readdir(dir)) {
+			struct stat st;
+			if (entry->d_name[0] != '.' && stat((folder + "/" + entry->d_name).c_str(), &st) == 0 && S_ISREG(st.st_mode))
+				total += st.st_size;
+		}
+		closedir(dir);
+	}
+	return total;
+}
+
+
+// Deletes the folder of an earlier state. Only a folder named state_... in the administrative folder is touched.
+static std::string
+DeleteState(const std::string& id)
+{
+	if (id.compare(0, 6, "state_") != 0 || id.find('/') != std::string::npos || id.find("..") != std::string::npos)
+		return "Not the name of a state: " + id;
+	std::string folder = std::string(kAdminDir) + "/" + id;
+	DIR* dir = opendir(folder.c_str());
+	if (dir == NULL)
+		return "Cannot open " + id + ": " + strerror(errno);
+	std::vector<std::string> files;
+	while (struct dirent* entry = readdir(dir)) {
+		if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+			files.push_back(entry->d_name);
+	}
+	closedir(dir);
+	for (size_t i = 0; i < files.size(); i++) {
+		if (unlink((folder + "/" + files[i]).c_str()) != 0)
+			return "Cannot delete " + files[i] + " of " + id + ": " + strerror(errno);
+	}
+	if (rmdir(folder.c_str()) != 0)
+		return "Cannot remove the folder of " + id + ": " + strerror(errno);
+	return "";
+}
+
+
+// How many of the states that can be restored now could not be restored any more without the given ones: the file of
+// a package is in the folder of the state that took it out, and an older state can need it too.
+static int
+CountBroken(const std::vector<State>& states, const std::set<std::string>& deleting)
+{
+	std::vector<State> remaining;
+	for (size_t i = 0; i < states.size(); i++) {
+		if (deleting.count(states[i].id) == 0)
+			remaining.push_back(states[i]);
+	}
+	int broken = 0;
+	for (size_t i = 0; i < remaining.size(); i++) {
+		Plan before = MakePlan(remaining[i], states);
+		if (!before.missing.empty() || ChangeCount(before) == 0)
+			continue;
+		Plan after = MakePlan(remaining[i], remaining);
+		if (!after.missing.empty())
+			broken++;
+	}
+	return broken;
+}
+
+
+static std::string
+SizeText(off_t bytes)
+{
+	char text[32];
+	if (bytes >= 1024 * 1024 * 1024)
+		snprintf(text, sizeof(text), "%.1f GB", bytes / (1024.0 * 1024.0 * 1024.0));
+	else
+		snprintf(text, sizeof(text), "%.0f MB", bytes / (1024.0 * 1024.0));
+	return text;
+}
+
+
 // ---------------------------------------------------------------------------------------------------------------
 // The window
 // ---------------------------------------------------------------------------------------------------------------
@@ -543,6 +622,7 @@ SaveSyslog(std::string* where)
 enum {
 	kMsgSelected	= 'sel!',
 	kMsgRestore		= 'rst!',
+	kMsgDelete		= 'del!',
 	kMsgUndo		= 'und!',
 	kMsgSyslog		= 'log!',
 	kMsgRestart		= 'rbt!',
@@ -556,6 +636,7 @@ struct Job {
 	std::string		kind;		// "restore" or "undo"
 	State			target;
 	std::vector<State> states;
+	std::vector<std::string> ids;	// the states to delete
 };
 
 
@@ -567,7 +648,20 @@ RunJob(void* data)
 	std::string error;
 	if (job->kind == "restore")
 		error = Restore(job->target, job->states, false, &report);
-	else
+	else if (job->kind == "delete") {
+		off_t freed = 0;
+		int deleted = 0;
+		for (size_t i = 0; i < job->ids.size() && error.empty(); i++) {
+			freed += StateSize(job->ids[i]);
+			error = DeleteState(job->ids[i]);
+			if (error.empty())
+				deleted++;
+		}
+		char text[96];
+		snprintf(text, sizeof(text), "Deleted %d %s, %s freed.", deleted, deleted == 1 ? "state" : "states",
+			SizeText(freed).c_str());
+		report = text;
+	} else
 		error = Undo(&report);
 	BMessage done(kMsgWorkDone);
 	done.AddString("kind", job->kind.c_str());
@@ -677,10 +771,10 @@ public:
 		BStringView* intro = new BStringView("intro",
 			"Go back to an earlier state of the system's packages, without the boot menu.");
 		BStringView* hint = new BStringView("hint",
-			"Nothing is deleted. Restart afterwards for the old system to start.");
+			"A restore keeps what it replaces, and Undo puts it back. Restart afterwards for the old system to start.");
 		hint->SetHighColor(tint_color(ui_color(B_PANEL_TEXT_COLOR), B_LIGHTEN_1_TINT));
 
-		fList = new BListView("states");
+		fList = new BListView("states", B_MULTIPLE_SELECTION_LIST);
 		fList->SetSelectionMessage(new BMessage(kMsgSelected));
 		BScrollView* listScroll = new BScrollView("listScroll", fList, 0, false, true);
 
@@ -691,6 +785,7 @@ public:
 
 		fRestore = new BButton("restore", "Restore selected state" B_UTF8_ELLIPSIS, new BMessage(kMsgRestore));
 		fUndo = new BButton("undo", "Undo last restore", new BMessage(kMsgUndo));
+		fDelete = new BButton("delete", "Delete selected" B_UTF8_ELLIPSIS, new BMessage(kMsgDelete));
 		fSyslog = new BButton("syslog", "Save syslog to Desktop", new BMessage(kMsgSyslog));
 		fRestart = new BButton("restart", "Restart" B_UTF8_ELLIPSIS, new BMessage(kMsgRestart));
 		fStatus = new BStringView("status", "");
@@ -711,6 +806,7 @@ public:
 			.AddGroup(B_HORIZONTAL)
 				.Add(fRestore)
 				.Add(fUndo)
+				.Add(fDelete)
 				.Add(fSyslog)
 				.AddGlue()
 				.Add(fRestart)
@@ -737,6 +833,9 @@ public:
 				break;
 			case kMsgUndo:
 				StartUndo();
+				break;
+			case kMsgDelete:
+				StartDelete();
 				break;
 			case kMsgSyslog:
 			{
@@ -826,14 +925,29 @@ private:
 
 	void UpdateButtons()
 	{
-		fRestore->SetEnabled(!fBusy && fList->CurrentSelection() >= 0 && SelectedPlanCanRun());
+		std::vector<const State*> picked = SelectedStates();
+		fRestore->SetEnabled(!fBusy && picked.size() == 1 && SelectedPlanCanRun());
 		fUndo->SetEnabled(!fBusy && Exists(LastRestoreFile()));
+		fDelete->SetEnabled(!fBusy && !picked.empty());
 	}
 
+	// the earlier states that are selected (not the current system, not the heading)
+	std::vector<const State*> SelectedStates() const
+	{
+		std::vector<const State*> picked;
+		for (int32 i = 0, index; (index = fList->CurrentSelection(i)) >= 0; i++) {
+			StateItem* item = dynamic_cast<StateItem*>(fList->ItemAt(index));
+			if (item != NULL && item->GetKind() == StateItem::kState)
+				picked.push_back(&item->GetState());
+		}
+		return picked;
+	}
+
+	// the one earlier state that is selected, or none when there are none or several
 	const State* Selected() const
 	{
-		StateItem* item = dynamic_cast<StateItem*>(fList->ItemAt(fList->CurrentSelection()));
-		return item != NULL && item->GetKind() == StateItem::kState ? &item->GetState() : NULL;
+		std::vector<const State*> picked = SelectedStates();
+		return picked.size() == 1 ? picked[0] : NULL;
 	}
 
 	bool SelectedPlanCanRun() const
@@ -851,6 +965,28 @@ private:
 		if (picked != NULL && picked->GetKind() == StateItem::kCurrent) {
 			fPreview->SetText("This is the system you are running now.\n\nPick one of the earlier states to see "
 				"what going back to it would change.");
+			UpdateButtons();
+			return;
+		}
+		std::vector<const State*> many = SelectedStates();
+		if (many.size() > 1) {
+			std::set<std::string> ids;
+			off_t size = 0;
+			for (size_t i = 0; i < many.size(); i++) {
+				ids.insert(many[i]->id);
+				size += StateSize(many[i]->id);
+			}
+			char text[200];
+			snprintf(text, sizeof(text), "%d states are selected.\n\nDeleting them would free about %s.\n",
+				(int)many.size(), SizeText(size).c_str());
+			std::string summary = text;
+			int broken = CountBroken(fStates, ids);
+			if (broken > 0) {
+				snprintf(text, sizeof(text), "\n%d other %s could not be restored any more.\n", broken,
+					broken == 1 ? "state" : "states");
+				summary += text;
+			}
+			fPreview->SetText(summary.c_str());
 			UpdateButtons();
 			return;
 		}
@@ -879,6 +1015,49 @@ private:
 		if (alert->Go() != 1)
 			return;
 		Start("restore", *state);
+	}
+
+	void StartDelete()
+	{
+		if (fBusy)
+			return;
+		std::vector<const State*> picked = SelectedStates();
+		if (picked.empty())
+			return;
+		std::set<std::string> ids;
+		off_t size = 0;
+		for (size_t i = 0; i < picked.size(); i++) {
+			ids.insert(picked[i]->id);
+			size += StateSize(picked[i]->id);
+		}
+		int broken = CountBroken(fStates, ids);
+
+		BString question;
+		question << "Delete " << (int)picked.size() << (picked.size() == 1 ? " state?" : " states?")
+			<< "\n\nThis frees about " << SizeText(size).c_str() << ". They cannot be restored afterwards, and this "
+			"cannot be undone.";
+		if (broken > 0) {
+			question << "\n\n" << broken << " other " << (broken == 1 ? "state" : "states")
+				<< " that can be restored now would not be restorable any more, because they need files kept in "
+				"the states you delete.";
+		}
+		question << "\n\nThe system you are running now is not touched.";
+		BAlert* alert = new BAlert("confirm", question.String(), "Cancel", "Delete", NULL, B_WIDTH_AS_USUAL,
+			B_STOP_ALERT);
+		alert->SetShortcut(0, B_ESCAPE);
+		if (alert->Go() != 1)
+			return;
+
+		Job* job = new Job;
+		job->window = BMessenger(this);
+		job->kind = "delete";
+		for (size_t i = 0; i < picked.size(); i++)
+			job->ids.push_back(picked[i]->id);
+		fBusy = true;
+		UpdateButtons();
+		SetStatus("Deleting...");
+		thread_id thread = spawn_thread(RunJob, "state delete", B_NORMAL_PRIORITY, job);
+		resume_thread(thread);
 	}
 
 	void StartUndo()
@@ -918,16 +1097,19 @@ private:
 			BAlert* alert = new BAlert("error", error.String(), "OK", NULL, NULL, B_WIDTH_AS_USUAL, B_STOP_ALERT);
 			alert->Go();
 		} else {
-			SetStatus(kind == "restore"
-				? "Done. The system has the packages of that state; restart for it to start."
-				: "Done. The packages of before the restore are back; restart for it to take effect.");
+			if (kind == "delete")
+				SetStatus(report.String());
+			else
+				SetStatus(kind == "restore"
+					? "Done. The system has the packages of that state; restart for it to start."
+					: "Done. The packages of before the restore are back; restart for it to take effect.");
 		}
 		// the system takes a few seconds to write its record of the change
 		BMessage refresh(kMsgRefresh);
 		delete fRefreshRunner;
 		fRefreshRunner = new BMessageRunner(this, &refresh, 4000000, 1);
 		Reload();
-		if (report.Length() > 0)
+		if (report.Length() > 0 && kind != "delete")
 			fPreview->SetText(report.String());
 	}
 
@@ -935,6 +1117,7 @@ private:
 	BTextView*			fPreview;
 	BButton*			fRestore;
 	BButton*			fUndo;
+	BButton*			fDelete;
 	BButton*			fSyslog;
 	BButton*			fRestart;
 	BStringView*		fStatus;
@@ -1014,13 +1197,42 @@ main(int argc, char** argv)
 			}
 			return 0;
 		}
+		if (command == "--delete" && argc >= 3) {
+			bool dryRun = strcmp(argv[argc - 1], "--dry-run") == 0;
+			std::set<std::string> ids;
+			off_t size = 0;
+			for (int i = 2; i < argc; i++) {
+				if (strcmp(argv[i], "--dry-run") == 0)
+					continue;
+				const State* state = FindState(states, argv[i]);
+				if (state == NULL) {
+					fprintf(stderr, "No such state: %s\n", argv[i]);
+					return 1;
+				}
+				ids.insert(state->id);
+				size += StateSize(state->id);
+			}
+			printf("%d states, %s, %d other states would not be restorable any more\n", (int)ids.size(),
+				SizeText(size).c_str(), CountBroken(states, ids));
+			if (dryRun)
+				return 0;
+			for (std::set<std::string>::const_iterator it = ids.begin(); it != ids.end(); ++it) {
+				std::string error = DeleteState(*it);
+				if (!error.empty()) {
+					fprintf(stderr, "%s\n", error.c_str());
+					return 1;
+				}
+				printf("deleted %s\n", it->c_str());
+			}
+			return 0;
+		}
 		if (command == "--syslog") {
 			std::string where;
 			std::string error = SaveSyslog(&where);
 			printf("%s\n", error.empty() ? where.c_str() : error.c_str());
 			return error.empty() ? 0 : 1;
 		}
-		fprintf(stderr, "StateRestore [--list | --plan <state> | --restore <state> [--dry-run] | --undo | --syslog]\n");
+		fprintf(stderr, "StateRestore [--list | --plan <state> | --restore <state> [--dry-run] | --undo | --delete <state>... [--dry-run] | --syslog]\n");
 		return 1;
 	}
 
