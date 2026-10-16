@@ -26,6 +26,11 @@ packages, in a folder on the Desktop) and **Restart**.
 It only helps when the system still boots. A system that does not start at all needs the boot menu or a rescue disk.
 Only the system packages are handled, not the ones in `~/config/packages`.
 
+## Install
+
+Install `staterestore-<version>-1-x86_64.hpkg` from the releases page for the whole system. It adds StateRestore to the
+Deskbar's Applications menu, and `StateRestore` to the command line.
+
 ## Build
 
 On Haiku: `make`. It needs `g++` and the Haiku development headers.

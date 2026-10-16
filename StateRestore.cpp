@@ -48,6 +48,10 @@
 #include <unistd.h>
 
 
+#ifndef STATERESTORE_VERSION
+#define STATERESTORE_VERSION "dev"
+#endif
+
 static const char* kAppSignature = "application/x-vnd.ablyss-StateRestore";
 static const char* kPackagesDir = "/boot/system/packages";
 static const char* kAdminDir = "/boot/system/packages/administrative";
@@ -833,7 +837,7 @@ class StateWindow : public BWindow {
 public:
 	StateWindow()
 		:
-		BWindow(BRect(100, 100, 760, 520), "State Restore", B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS),
+		BWindow(BRect(100, 100, 760, 520), "State Restore " STATERESTORE_VERSION, B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS),
 		fBusy(false),
 		fRefreshRunner(NULL)
 	{
