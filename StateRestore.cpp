@@ -697,7 +697,6 @@ enum {
 	kMsgDelete		= 'del!',
 	kMsgCleanup		= 'cln!',
 	kMsgUndo		= 'und!',
-	kMsgSyslog		= 'log!',
 	kMsgRestart		= 'rbt!',
 	kMsgRefresh		= 'rfr!',
 	kMsgWorkDone	= 'wrk!'
@@ -860,7 +859,6 @@ public:
 		fUndo = new BButton("undo", "Undo last restore", new BMessage(kMsgUndo));
 		fDelete = new BButton("delete", "Delete selected" B_UTF8_ELLIPSIS, new BMessage(kMsgDelete));
 		fCleanup = new BButton("cleanup", "Delete unrestorable" B_UTF8_ELLIPSIS, new BMessage(kMsgCleanup));
-		fSyslog = new BButton("syslog", "Save syslog to Desktop", new BMessage(kMsgSyslog));
 		fRestart = new BButton("restart", "Restart" B_UTF8_ELLIPSIS, new BMessage(kMsgRestart));
 		fStatus = new BStringView("status", "");
 
@@ -882,7 +880,6 @@ public:
 				.Add(fUndo)
 				.Add(fDelete)
 				.Add(fCleanup)
-				.Add(fSyslog)
 				.AddGlue()
 				.Add(fRestart)
 			.End()
@@ -915,16 +912,6 @@ public:
 			case kMsgCleanup:
 				StartCleanup();
 				break;
-			case kMsgSyslog:
-			{
-				std::string where;
-				std::string error = SaveSyslog(&where);
-				if (error.empty())
-					SetStatus(("Saved on the Desktop: " + where).c_str());
-				else
-					SetStatus(error.c_str());
-				break;
-			}
 			case kMsgRestart:
 			{
 				BAlert* alert = new BAlert("restart", "Restart the computer now?", "Not now", "Restart", NULL,
@@ -1235,7 +1222,6 @@ private:
 	BButton*			fUndo;
 	BButton*			fDelete;
 	BButton*			fCleanup;
-	BButton*			fSyslog;
 	BButton*			fRestart;
 	BStringView*		fStatus;
 	std::vector<State>	fStates;

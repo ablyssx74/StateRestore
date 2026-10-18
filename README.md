@@ -20,8 +20,7 @@ that took it out, and an older state can need them). Deleting cannot be undone. 
 **Delete unrestorable…** deletes the states that cannot be restored (package files missing) or are the same as the system now.
 A state whose folder holds package files that a restorable state needs is kept, and the confirmation says how many.
 
-The window also has **Save syslog to Desktop** (the system log, `listusb`, `listdev`, `uname` and the list of active
-packages, in a folder on the Desktop) and **Restart**.
+The window also has **Restart…**, with a confirmation.
 
 It only helps when the system still boots. A system that does not start at all needs the boot menu or a rescue disk.
 Only the system packages are handled, not the ones in `~/config/packages`.
