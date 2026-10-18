@@ -944,6 +944,7 @@ public:
 	StateWindow()
 		:
 		BWindow(BRect(100, 100, 760, 520), "State Restore " STATERESTORE_VERSION, B_TITLED_WINDOW, B_AUTO_UPDATE_SIZE_LIMITS),
+		fCleanupKept(0),
 		fBusy(false),
 		fRefreshRunner(NULL)
 	{
@@ -1049,6 +1050,8 @@ private:
 	{
 		fStates = LoadAllStates();
 		fList->MakeEmpty();
+		fCleanupKept = 0;
+		fCleanupIds = CleanupSet(fStates, &fCleanupKept);	// worked out once here: the button is grey when there is nothing
 
 		NameSet current = CurrentPackages();
 		BString since;
@@ -1131,7 +1134,7 @@ private:
 		fRestore->SetEnabled(!fBusy && picked.size() == 1 && SelectedPlanCanRun());
 		fUndo->SetEnabled(!fBusy && Exists(LastRestoreFile()));
 		fDelete->SetEnabled(!fBusy && !SelectedStates(true).empty());
-		fCleanup->SetEnabled(!fBusy);
+		fCleanup->SetEnabled(!fBusy && !fCleanupIds.empty());
 	}
 
 	// the earlier states that are selected (not the current system, not the heading)
@@ -1264,8 +1267,8 @@ private:
 	{
 		if (fBusy)
 			return;
-		int kept = 0;
-		std::vector<std::string> ids = CleanupSet(fStates, &kept);
+		int kept = fCleanupKept;
+		std::vector<std::string> ids = fCleanupIds;
 		if (ids.empty()) {
 			BAlert* none = new BAlert("none", "There are no states to clean up.", "OK", NULL, NULL, B_WIDTH_AS_USUAL,
 				B_INFO_ALERT);
@@ -1382,6 +1385,8 @@ private:
 	BButton*			fRestart;
 	BStringView*		fStatus;
 	std::vector<State>	fStates;
+	std::vector<std::string> fCleanupIds;	// the states Delete unrestorable would delete
+	int					fCleanupKept;
 	bool				fBusy;
 	BMessageRunner*		fRefreshRunner;
 };
