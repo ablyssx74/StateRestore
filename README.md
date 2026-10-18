@@ -17,7 +17,11 @@ Several earlier states can be selected and deleted with **Delete selected…**, 
 frees and how many other states could not be restored any more (the files of a package are kept in the folder of the state
 that took it out, and an older state can need them). Deleting cannot be undone. The system running now is never touched.
 
-**Delete unrestorable…** deletes the states that cannot be restored (package files missing) or are the same as the system now.
+The states that cannot be restored are shown too, under "Cannot be restored", dimmed and marked DAMAGED (their list of packages is
+damaged, which a shutdown in the middle of a write can cause), MISSING (package files they need are gone) or SAME (nothing to restore).
+Selecting one explains why.
+
+**Delete unrestorable…** deletes all of those states, after a confirmation that counts each kind.
 A state whose folder holds package files that a restorable state needs is kept, and the confirmation says how many.
 
 The window also has **Restart…**, with a confirmation.
@@ -51,3 +55,5 @@ with `g++-x86` (the secondary architecture's compiler), as Cricket does.
 ## Licence
 
 MIT.
+
+For testing, `STATERESTORE_ADMIN_DIR=<folder>` makes the program look at another folder of states; nothing is changed then.

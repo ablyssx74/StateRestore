@@ -55,8 +55,11 @@
 static const char* kAppSignature = "application/x-vnd.ablyss-StateRestore";
 static const char* kPackagesDir = "/boot/system/packages";
 static const char* kAdminDir = "/boot/system/packages/administrative";
+static bool gTestFolder = false;	// STATERESTORE_ADMIN_DIR: look at another folder of states; nothing is changed
 
 typedef std::set<std::string> NameSet;
+
+enum { kProblemNone = 0, kProblemDamaged, kProblemMissing, kProblemSame };
 
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -70,7 +73,10 @@ struct State {
 	NameSet		files;		// the package files in its folder (the ones its change took out)
 	int			changes;	// how many packages differ from the system now
 	bool		restorable;	// all of what it needs is there, and it differs from now
-	State() : changes(0), restorable(false) {}
+	bool		damaged;	// its list of packages could not be read
+	int			problem;	// why it cannot be restored: kProblemNone, kProblemDamaged, kProblemMissing, kProblemSame
+	std::vector<std::string> missingFiles;	// what it needs that is nowhere (when kProblemMissing)
+	State() : changes(0), restorable(false), damaged(false), problem(0) {}
 };
 
 
@@ -218,8 +224,9 @@ LoadStates()
 		state.id = entry->d_name;
 		state.label = LabelOf(state.id);
 		if (!ReadList(std::string(kAdminDir) + "/" + state.id + "/activated-packages", state.packages)) {
+			// kept, so that the package files in its folder still count, and it can be shown and deleted
 			gDamagedStates++;
-			continue;
+			state.damaged = true;
 		}
 		ScanFolderForPackages(std::string(kAdminDir) + "/" + state.id, &state.files, NULL);
 		states.push_back(state);
@@ -317,6 +324,10 @@ static Plan
 MakePlan(const State& target, const std::vector<State>& states, const std::set<std::string>* excluded)
 {
 	Plan plan;
+	if (target.damaged) {
+		plan.error = "The list of packages of that state is damaged.";
+		return plan;
+	}
 	NameSet current = CurrentPackages();
 	if (current.empty()) {
 		plan.error = "The list of active packages could not be read.";
@@ -403,9 +414,20 @@ LoadAllStates()
 {
 	std::vector<State> states = LoadStates();
 	for (size_t i = 0; i < states.size(); i++) {
+		if (states[i].damaged) {
+			states[i].problem = kProblemDamaged;
+			continue;
+		}
 		Plan plan = MakePlan(states[i], states);
 		states[i].changes = ChangeCount(plan);
-		states[i].restorable = plan.error.empty() && plan.missing.empty() && states[i].changes > 0;
+		if (!plan.error.empty() || !plan.missing.empty()) {
+			states[i].problem = kProblemMissing;
+			states[i].missingFiles = plan.missing;
+		} else if (states[i].changes == 0) {
+			states[i].problem = kProblemSame;
+		} else {
+			states[i].restorable = true;
+		}
 	}
 	return states;
 }
@@ -504,6 +526,8 @@ LastRestoreFile()
 static std::string
 Restore(const State& target, const std::vector<State>& states, bool dryRun, std::string* report)
 {
+	if (gTestFolder && !dryRun)
+		return "A test folder of states is in use: nothing is changed.";
 	Plan plan = MakePlan(target, states);
 	if (report != NULL)
 		*report = DescribePlan(plan);
@@ -577,6 +601,8 @@ Restore(const State& target, const std::vector<State>& states, bool dryRun, std:
 static std::string
 Undo(std::string* report)
 {
+	if (gTestFolder)
+		return "A test folder of states is in use: nothing is changed.";
 	NameSet last;
 	if (!ReadList(LastRestoreFile(), last) || last.empty())
 		return "There is no restore to undo.";
@@ -655,6 +681,8 @@ StateSize(const std::string& id)
 static std::string
 DeleteState(const std::string& id)
 {
+	if (gTestFolder)
+		return "A test folder of states is in use: nothing is deleted.";
 	if (id.compare(0, 6, "state_") != 0 || id.find('/') != std::string::npos || id.find("..") != std::string::npos)
 		return "Not the name of a state: " + id;
 	std::string folder = std::string(kAdminDir) + "/" + id;
@@ -734,6 +762,36 @@ SizeText(off_t bytes)
 }
 
 
+// What to say about a state that cannot be restored.
+static std::string
+ExplainProblem(const State& state)
+{
+	std::string text = "State of " + state.label + "\n\n";
+	if (state.problem == kProblemDamaged) {
+		text += "Cannot be restored: the list of packages of this state is damaged.\n\n"
+			"It holds data that is not package names. A shutdown or a crash in the middle of a write can leave a file like "
+			"that. Nothing can be restored from it.\n\n"
+			"Its folder may still hold package files that other states need; Delete unrestorable keeps it when they do.\n";
+	} else if (state.problem == kProblemMissing) {
+		text += "Cannot be restored: package files this state needs are not on this computer any more.\n\nMissing:\n";
+		for (size_t i = 0; i < state.missingFiles.size() && i < 30; i++)
+			text += "  " + state.missingFiles[i] + "\n";
+		if (state.missingFiles.size() > 30) {
+			char more[48];
+			snprintf(more, sizeof(more), "  and %d more\n", (int)(state.missingFiles.size() - 30));
+			text += more;
+		}
+		text += "\nA package that is moved or deleted by hand in /boot/system/packages, and not taken out with pkgman, "
+			"is not kept in the folder of the state, so the states that need it cannot be restored. A package taken out "
+			"with pkgman, or by an update, is normally kept.\n";
+	} else {
+		text += "Nothing to restore: this state has the same packages as the system now.\n";
+	}
+	text += "\nIt can be deleted with Delete selected or Delete unrestorable.\n";
+	return text;
+}
+
+
 // ---------------------------------------------------------------------------------------------------------------
 // The window
 // ---------------------------------------------------------------------------------------------------------------
@@ -796,7 +854,7 @@ RunJob(void* data)
 // restored. The columns are the date, the Haiku revision and what differs from now.
 class StateItem : public BListItem {
 public:
-	enum Kind { kCurrent, kHeading, kState };
+	enum Kind { kCurrent, kHeading, kState, kProblem };
 
 	StateItem(Kind kind, const State& state, const BString& date, const BString& revision, const BString& detail,
 		const BString& tag)
@@ -835,6 +893,8 @@ public:
 			text = ui_color(B_LIST_SELECTED_ITEM_TEXT_COLOR);
 		} else if (fKind == kCurrent) {
 			text = ui_color(B_LIST_ITEM_TEXT_COLOR);
+		} else if (fKind == kProblem) {
+			text = mix_color(text, background, 150);	// dimmed: it cannot be restored
 		}
 		owner->SetHighColor(background);
 		owner->FillRect(frame);
@@ -1028,16 +1088,36 @@ private:
 			fList->AddItem(new StateItem(StateItem::kState, fStates[i], fStates[i].label.c_str(), rev, text, tag));
 			added++;
 		}
+
+		// the states that cannot be restored, and why, in a list of their own
+		int problems = 0;
+		for (size_t i = 0; i < fStates.size(); i++) {
+			if (fStates[i].restorable)
+				continue;
+			if (problems == 0)
+				fList->AddItem(new StateItem(StateItem::kHeading, State(), "Cannot be restored", "", "", ""));
+			BString detail, tag;
+			if (fStates[i].problem == kProblemDamaged) {
+				tag = "DAMAGED";
+				detail = "list of packages damaged";
+			} else if (fStates[i].problem == kProblemMissing) {
+				tag = "MISSING";
+				detail << (int)fStates[i].missingFiles.size()
+					<< (fStates[i].missingFiles.size() == 1 ? " package file missing" : " package files missing");
+			} else {
+				tag = "SAME";
+				detail = "same packages as now";
+			}
+			BString rev(HaikuRevision(fStates[i].packages).c_str());
+			fList->AddItem(new StateItem(StateItem::kProblem, fStates[i], fStates[i].label.c_str(), rev, detail, tag));
+			problems++;
+		}
 		fPreview->SetText(added > 0 ? "Pick a state on the left to see what a restore would change."
 			: "There is no earlier state that can be restored.");
 		BString note;
 		if (gCurrentListDamaged) {
 			note << "The system's list of active packages is damaged (a shutdown in the middle of a write can do that); "
 				"the packages folder is used instead. ";
-		}
-		if (gDamagedStates > 0) {
-			note << gDamagedStates << (gDamagedStates == 1 ? " state with a damaged list is" : " states with damaged lists are")
-				<< " left out.";
 		}
 		if (note.Length() > 0 && strlen(fStatus->Text()) == 0)
 			SetStatus(note.String());
@@ -1050,17 +1130,18 @@ private:
 		std::vector<const State*> picked = SelectedStates();
 		fRestore->SetEnabled(!fBusy && picked.size() == 1 && SelectedPlanCanRun());
 		fUndo->SetEnabled(!fBusy && Exists(LastRestoreFile()));
-		fDelete->SetEnabled(!fBusy && !picked.empty());
+		fDelete->SetEnabled(!fBusy && !SelectedStates(true).empty());
 		fCleanup->SetEnabled(!fBusy);
 	}
 
 	// the earlier states that are selected (not the current system, not the heading)
-	std::vector<const State*> SelectedStates() const
+	std::vector<const State*> SelectedStates(bool includeProblems = false) const
 	{
 		std::vector<const State*> picked;
 		for (int32 i = 0, index; (index = fList->CurrentSelection(i)) >= 0; i++) {
 			StateItem* item = dynamic_cast<StateItem*>(fList->ItemAt(index));
-			if (item != NULL && item->GetKind() == StateItem::kState)
+			if (item != NULL && (item->GetKind() == StateItem::kState
+					|| (includeProblems && item->GetKind() == StateItem::kProblem)))
 				picked.push_back(&item->GetState());
 		}
 		return picked;
@@ -1091,7 +1172,12 @@ private:
 			UpdateButtons();
 			return;
 		}
-		std::vector<const State*> many = SelectedStates();
+		if (picked != NULL && picked->GetKind() == StateItem::kProblem && SelectedStates(true).size() == 1) {
+			fPreview->SetText(ExplainProblem(picked->GetState()).c_str());
+			UpdateButtons();
+			return;
+		}
+		std::vector<const State*> many = SelectedStates(true);
 		if (many.size() > 1) {
 			std::set<std::string> ids;
 			off_t size = 0;
@@ -1144,7 +1230,7 @@ private:
 	{
 		if (fBusy)
 			return;
-		std::vector<const State*> picked = SelectedStates();
+		std::vector<const State*> picked = SelectedStates(true);
 		if (picked.empty())
 			return;
 		std::set<std::string> ids;
@@ -1190,11 +1276,24 @@ private:
 		for (size_t i = 0; i < ids.size(); i++)
 			size += StateSize(ids[i]);
 
+		int damaged = 0, missing = 0, same = 0;
+		for (size_t i = 0; i < ids.size(); i++) {
+			for (size_t k = 0; k < fStates.size(); k++) {
+				if (fStates[k].id != ids[i])
+					continue;
+				if (fStates[k].problem == kProblemDamaged)
+					damaged++;
+				else if (fStates[k].problem == kProblemMissing)
+					missing++;
+				else
+					same++;
+			}
+		}
 		BString question;
 		question << "Delete " << (int)ids.size() << " old " << (ids.size() == 1 ? "state" : "states")
-			<< " that cannot be restored?\n\nThey are the states with package files missing, and the ones that are the "
-			"same as the system now. This frees about " << SizeText(size).c_str()
-			<< ". It cannot be undone.";
+			<< " that cannot be restored?\n\n" << damaged << " with a damaged list of packages, " << missing
+			<< " with package files missing, " << same << " the same as the system now.\n\nThis frees about "
+			<< SizeText(size).c_str() << ". It cannot be undone.";
 		if (kept > 0) {
 			question << "\n\n" << kept << (kept == 1 ? " is" : " are") << " kept, because a state that can be "
 				"restored needs files in " << (kept == 1 ? "it" : "them") << ".";
@@ -1322,17 +1421,27 @@ FindState(const std::vector<State>& states, const char* id)
 int
 main(int argc, char** argv)
 {
+	const char* testFolder = getenv("STATERESTORE_ADMIN_DIR");
+	if (testFolder != NULL && testFolder[0] != '\0') {
+		kAdminDir = testFolder;
+		gTestFolder = true;
+	}
+
 	if (argc >= 2) {
 		std::vector<State> states = LoadAllStates();
 		std::string command = argv[1];
 		if (command == "--list") {
 			if (gCurrentListDamaged)
 				fprintf(stderr, "The system's list of active packages is damaged; the packages folder is used instead.\n");
-			if (gDamagedStates > 0)
-				fprintf(stderr, "%d states with a damaged list are left out.\n", gDamagedStates);
+
 			for (size_t i = 0; i < states.size(); i++) {
-				Plan plan = MakePlan(states[i], states);
-				printf("%s  %d differ%s\n", states[i].id.c_str(), ChangeCount(plan), plan.missing.empty() ? "" : "  (files missing)");
+				const char* why = states[i].problem == kProblemDamaged ? "  (damaged list)"
+					: states[i].problem == kProblemMissing ? "  (files missing)"
+					: states[i].problem == kProblemSame ? "  (same as now)" : "";
+				if (states[i].damaged)
+					printf("%s  ?%s\n", states[i].id.c_str(), why);
+				else
+					printf("%s  %d differ%s\n", states[i].id.c_str(), states[i].changes, why);
 			}
 			return 0;
 		}
@@ -1343,6 +1452,11 @@ main(int argc, char** argv)
 				return 1;
 			}
 			bool dryRun = command == "--plan" || (argc >= 4 && strcmp(argv[3], "--dry-run") == 0);
+			if (command == "--plan" && state->problem != kProblemNone) {
+				// a state that cannot be restored: say why
+				printf("%s", ExplainProblem(*state).c_str());
+				return 1;
+			}
 			std::string report;
 			std::string error = Restore(*state, states, dryRun, &report);
 			printf("%s", report.c_str());
