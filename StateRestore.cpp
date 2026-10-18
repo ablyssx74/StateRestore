@@ -74,21 +74,47 @@ struct State {
 };
 
 
+// A line of an activation file is the file name of a package. A list that has anything else in it is damaged (the system's
+// own file can be, after a shutdown in the middle of a write) and is not used.
+static bool
+LooksLikePackageFile(const char* line, size_t length)
+{
+	if (length < 6 || length > 250 || strcmp(line + length - 5, ".hpkg") != 0)
+		return false;
+	for (size_t i = 0; i < length; i++) {
+		unsigned char c = (unsigned char)line[i];
+		if (c < 0x20 || c >= 0x7f || c == '/')
+			return false;
+	}
+	return true;
+}
+
+
 static bool
 ReadList(const std::string& path, NameSet& out)
 {
 	FILE* file = fopen(path.c_str(), "r");
 	if (file == NULL)
 		return false;
+	NameSet found;
+	bool damaged = false;
 	char line[2048];
 	while (fgets(line, sizeof(line), file) != NULL) {
 		size_t length = strlen(line);
 		while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r'))
 			line[--length] = '\0';
-		if (length > 0)
-			out.insert(line);
+		if (length == 0)
+			continue;
+		if (!LooksLikePackageFile(line, length)) {
+			damaged = true;
+			break;
+		}
+		found.insert(line);
 	}
 	fclose(file);
+	if (damaged || found.empty())
+		return false;
+	out.insert(found.begin(), found.end());
 	return true;
 }
 
@@ -122,11 +148,29 @@ LabelOf(const std::string& id)
 }
 
 
+static bool gCurrentListDamaged = false;	// the system's own list of active packages could not be read
+static int gDamagedStates = 0;			// states whose list could not be read
+
+
 static NameSet
 CurrentPackages()
 {
 	NameSet current;
-	ReadList(std::string(kAdminDir) + "/activated-packages", current);
+	gCurrentListDamaged = false;
+	if (!ReadList(std::string(kAdminDir) + "/activated-packages", current)) {
+		// the system's list is damaged: packagefs then loads every package in the packages folder, so that is the state
+		gCurrentListDamaged = true;
+		current.clear();
+		DIR* dir = opendir(kPackagesDir);
+		if (dir != NULL) {
+			while (struct dirent* entry = readdir(dir)) {
+				size_t length = strlen(entry->d_name);
+				if (length > 5 && strcmp(entry->d_name + length - 5, ".hpkg") == 0)
+					current.insert(entry->d_name);
+			}
+			closedir(dir);
+		}
+	}
 	return current;
 }
 
@@ -163,6 +207,7 @@ static std::vector<State>
 LoadStates()
 {
 	std::vector<State> states;
+	gDamagedStates = 0;
 	DIR* dir = opendir(kAdminDir);
 	if (dir == NULL)
 		return states;
@@ -172,8 +217,10 @@ LoadStates()
 		State state;
 		state.id = entry->d_name;
 		state.label = LabelOf(state.id);
-		if (!ReadList(std::string(kAdminDir) + "/" + state.id + "/activated-packages", state.packages))
+		if (!ReadList(std::string(kAdminDir) + "/" + state.id + "/activated-packages", state.packages)) {
+			gDamagedStates++;
 			continue;
+		}
 		ScanFolderForPackages(std::string(kAdminDir) + "/" + state.id, &state.files, NULL);
 		states.push_back(state);
 	}
@@ -983,6 +1030,17 @@ private:
 		}
 		fPreview->SetText(added > 0 ? "Pick a state on the left to see what a restore would change."
 			: "There is no earlier state that can be restored.");
+		BString note;
+		if (gCurrentListDamaged) {
+			note << "The system's list of active packages is damaged (a shutdown in the middle of a write can do that); "
+				"the packages folder is used instead. ";
+		}
+		if (gDamagedStates > 0) {
+			note << gDamagedStates << (gDamagedStates == 1 ? " state with a damaged list is" : " states with damaged lists are")
+				<< " left out.";
+		}
+		if (note.Length() > 0 && strlen(fStatus->Text()) == 0)
+			SetStatus(note.String());
 		fRestore->SetEnabled(false);
 		UpdateButtons();
 	}
@@ -1268,6 +1326,10 @@ main(int argc, char** argv)
 		std::vector<State> states = LoadAllStates();
 		std::string command = argv[1];
 		if (command == "--list") {
+			if (gCurrentListDamaged)
+				fprintf(stderr, "The system's list of active packages is damaged; the packages folder is used instead.\n");
+			if (gDamagedStates > 0)
+				fprintf(stderr, "%d states with a damaged list are left out.\n", gDamagedStates);
 			for (size_t i = 0; i < states.size(); i++) {
 				Plan plan = MakePlan(states[i], states);
 				printf("%s  %d differ%s\n", states[i].id.c_str(), ChangeCount(plan), plan.missing.empty() ? "" : "  (files missing)");
