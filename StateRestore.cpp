@@ -12,6 +12,11 @@
 
 #include <Alert.h>
 #include <Application.h>
+#include <FilePanel.h>
+#include <MenuField.h>
+#include <MenuItem.h>
+#include <PopUpMenu.h>
+#include <VolumeRoster.h>
 #include <Button.h>
 #include <Directory.h>
 #include <Entry.h>
@@ -53,8 +58,11 @@
 #endif
 
 static const char* kAppSignature = "application/x-vnd.ablyss-StateRestore";
-static const char* kPackagesDir = "/boot/system/packages";
-static const char* kAdminDir = "/boot/system/packages/administrative";
+// The system that is worked on: the running one (/boot), or another Haiku that is mounted (/Haiku1, say).
+static std::string gRoot = "/boot";
+static std::string kPackagesDir = "/boot/system/packages";
+static std::string kAdminDir = "/boot/system/packages/administrative";
+static bool gForeign = false;		// another system than the running one: no package daemon looks after its list
 static bool gTestFolder = false;	// STATERESTORE_ADMIN_DIR: look at another folder of states; nothing is changed
 
 typedef std::set<std::string> NameSet;
@@ -136,6 +144,8 @@ Exists(const std::string& path)
 static std::string
 HoldRoot()
 {
+	if (gForeign)
+		return gRoot + "/home/config/var/StateRestore";	// on that system's own disk: its free space, and kept with it
 	BPath path;
 	if (find_directory(B_USER_VAR_DIRECTORY, &path, true) != B_OK)
 		return "/boot/home/config/var/StateRestore";
@@ -154,6 +164,38 @@ LabelOf(const std::string& id)
 }
 
 
+// Is this folder the root of a Haiku system (a mounted boot volume)? Gives the reason when it is not.
+static std::string
+CheckRoot(const std::string& root)
+{
+	if (!Exists(root + "/system/packages/administrative/activated-packages"))
+		return root + " does not look like a Haiku system: there is no system/packages/administrative/activated-packages.";
+	if (root != "/boot") {
+		BVolume volume(dev_for_path(root.c_str()));
+		if (volume.InitCheck() == B_OK && volume.IsReadOnly())
+			return root + " is mounted read-only. Mount it with write access to change it.";
+		struct stat mine, other;
+		if (stat("/boot/system/packages", &mine) == 0 && stat((root + "/system/packages").c_str(), &other) == 0
+				&& mine.st_dev == other.st_dev && mine.st_ino == other.st_ino)
+			return root + " is the system running now: choose \"This computer\" for that one.";
+	}
+	return "";
+}
+
+
+static void
+SetRoot(const std::string& root)
+{
+	std::string clean = root;
+	while (clean.size() > 1 && clean[clean.size() - 1] == '/')
+		clean.resize(clean.size() - 1);
+	gRoot = clean;
+	gForeign = clean != "/boot";
+	kPackagesDir = clean + "/system/packages";
+	kAdminDir = kPackagesDir + "/administrative";
+}
+
+
 static bool gCurrentListDamaged = false;	// the system's own list of active packages could not be read
 static int gDamagedStates = 0;			// states whose list could not be read
 
@@ -167,7 +209,7 @@ CurrentPackages()
 		// the system's list is damaged: packagefs then loads every package in the packages folder, so that is the state
 		gCurrentListDamaged = true;
 		current.clear();
-		DIR* dir = opendir(kPackagesDir);
+		DIR* dir = opendir(kPackagesDir.c_str());
 		if (dir != NULL) {
 			while (struct dirent* entry = readdir(dir)) {
 				size_t length = strlen(entry->d_name);
@@ -214,7 +256,7 @@ LoadStates()
 {
 	std::vector<State> states;
 	gDamagedStates = 0;
-	DIR* dir = opendir(kAdminDir);
+	DIR* dir = opendir(kAdminDir.c_str());
 	if (dir == NULL)
 		return states;
 	while (struct dirent* entry = readdir(dir)) {
@@ -515,6 +557,35 @@ Timestamp()
 }
 
 
+// "2026-11-16_12:30:05", the way the package daemon names the folder of a state.
+static std::string
+StateStamp()
+{
+	char text[32];
+	time_t now = time(NULL);
+	struct tm local;
+	localtime_r(&now, &local);
+	strftime(text, sizeof(text), "%Y-%m-%d_%H:%M:%S", &local);
+	return text;
+}
+
+
+// Writes the list of active packages the way the package daemon does: all of it or nothing.
+static bool
+WriteActivatedList(const std::vector<std::string>& names)
+{
+	std::string path = kAdminDir + "/activated-packages";
+	std::string temp = path + ".new";
+	if (!WriteLines(temp, names))
+		return false;
+	if (rename(temp.c_str(), path.c_str()) != 0) {
+		unlink(temp.c_str());
+		return false;
+	}
+	return true;
+}
+
+
 static std::string
 LastRestoreFile()
 {
@@ -547,13 +618,30 @@ Restore(const State& target, const std::vector<State>& states, bool dryRun, std:
 		if (stat(it->second.c_str(), &st) == 0)
 			needed += st.st_size;
 	}
-	BVolume volume(dev_for_path(kPackagesDir));
+	BVolume volume(dev_for_path(kPackagesDir.c_str()));
 	if (volume.InitCheck() == B_OK && volume.FreeBytes() < needed + 64 * 1024 * 1024)
 		return "There is not enough free space on the boot disk.";
 
-	std::string holdDir = HoldRoot() + "/held/" + Timestamp();
-	if (create_directory((HoldRoot() + "/held").c_str(), 0755) != B_OK || create_directory(holdDir.c_str(), 0755) != B_OK)
-		return "Cannot make the folder for the packages that are taken out.";
+	// On the running system the packages that are taken out are kept in a folder of ours. On another system nobody
+	// is there to make the folder of the state that the change leaves behind, so it is made here, the way the
+	// package daemon makes it: the list of what was active, and the packages that are taken out.
+	std::string holdDir;
+	if (gForeign) {
+		holdDir = kAdminDir + "/state_" + StateStamp();
+		if (Exists(holdDir))
+			return "A state with the name " + holdDir.substr(holdDir.rfind('/') + 1) + " exists already: try again in a second.";
+		if (create_directory(HoldRoot().c_str(), 0755) != B_OK || create_directory(holdDir.c_str(), 0755) != B_OK)
+			return "Cannot make the folder for the packages that are taken out.";
+		NameSet old = CurrentPackages();
+		if (!WriteLines(holdDir + "/activated-packages", std::vector<std::string>(old.begin(), old.end()))) {
+			rmdir(holdDir.c_str());
+			return "Cannot write the list of the packages that are active now.";
+		}
+	} else {
+		holdDir = HoldRoot() + "/held/" + Timestamp();
+		if (create_directory((HoldRoot() + "/held").c_str(), 0755) != B_OK || create_directory(holdDir.c_str(), 0755) != B_OK)
+			return "Cannot make the folder for the packages that are taken out.";
+	}
 
 	// 1. the packages to put back are copied next to the others under a name the system ignores
 	std::string error;
@@ -592,6 +680,11 @@ Restore(const State& target, const std::vector<State>& states, bool dryRun, std:
 	WriteLines(holdDir + "/removed.txt", plan.remove);
 	WriteLines(holdDir + "/added.txt", plan.add);
 	WriteLines(LastRestoreFile(), std::vector<std::string>(1, holdDir));
+	if (gForeign && error.empty()) {
+		// that system reads this list when it starts: it is what makes the restore count
+		if (!WriteActivatedList(std::vector<std::string>(target.packages.begin(), target.packages.end())))
+			error = "The packages are in place, but the list of active packages could not be written.";
+	}
 	if (report != NULL)
 		*report = DescribePlan(plan);
 	return error;
@@ -603,10 +696,19 @@ Undo(std::string* report)
 {
 	if (gTestFolder)
 		return "A test folder of states is in use: nothing is changed.";
-	NameSet last;
-	if (!ReadList(LastRestoreFile(), last) || last.empty())
+	// the file holds one line: the folder where the last restore put what it took out (a path, not a package name)
+	std::string holdDir;
+	if (FILE* file = fopen(LastRestoreFile().c_str(), "r")) {
+		char line[2048];
+		if (fgets(line, sizeof(line), file) != NULL) {
+			holdDir = line;
+			while (!holdDir.empty() && (holdDir[holdDir.size() - 1] == '\n' || holdDir[holdDir.size() - 1] == '\r'))
+				holdDir.resize(holdDir.size() - 1);
+		}
+		fclose(file);
+	}
+	if (holdDir.empty())
 		return "There is no restore to undo.";
-	std::string holdDir = *last.begin();
 	NameSet removed, added;
 	if (!ReadList(holdDir + "/removed.txt", removed) || !ReadList(holdDir + "/added.txt", added))
 		return "The record of the last restore is not complete.";
@@ -617,7 +719,7 @@ Undo(std::string* report)
 	}
 
 	// the kept packages are put next to the others, then the swap back
-	std::string undoneDir = holdDir + "/undone";
+	std::string undoneDir = gForeign ? holdDir : holdDir + "/undone";
 	create_directory(undoneDir.c_str(), 0755);
 	for (NameSet::const_iterator it = removed.begin(); it != removed.end(); ++it)
 		rename((holdDir + "/" + *it).c_str(), (std::string(kPackagesDir) + "/" + *it + ".stage").c_str());
@@ -626,6 +728,14 @@ Undo(std::string* report)
 	for (NameSet::const_iterator it = removed.begin(); it != removed.end(); ++it) {
 		std::string to = std::string(kPackagesDir) + "/" + *it;
 		rename((to + ".stage").c_str(), to.c_str());
+	}
+	if (gForeign) {
+		// the list that was active before the restore is in the folder of that state
+		NameSet before;
+		if (!ReadList(holdDir + "/activated-packages", before))
+			return "The packages are back, but the list of the state before the restore is damaged.";
+		if (!WriteActivatedList(std::vector<std::string>(before.begin(), before.end())))
+			return "The packages are back, but the list of active packages could not be written.";
 	}
 	unlink(LastRestoreFile().c_str());
 	if (report != NULL)
@@ -804,6 +914,8 @@ enum {
 	kMsgUndo		= 'und!',
 	kMsgRestart		= 'rbt!',
 	kMsgRefresh		= 'rfr!',
+	kMsgSystem		= 'sys!',
+	kMsgOtherFolder	= 'oth!',
 	kMsgWorkDone	= 'wrk!'
 };
 
@@ -950,9 +1062,11 @@ public:
 	{
 		BStringView* intro = new BStringView("intro",
 			"Go back to an earlier state of the system's packages, without the boot menu.");
-		BStringView* hint = new BStringView("hint",
-			"A restore keeps what it replaces, and Undo puts it back. Restart afterwards for the old system to start.");
-		hint->SetHighColor(tint_color(ui_color(B_PANEL_TEXT_COLOR), B_LIGHTEN_1_TINT));
+		fHint = new BStringView("hint", "");
+		fHint->SetHighColor(tint_color(ui_color(B_PANEL_TEXT_COLOR), B_LIGHTEN_1_TINT));
+		fSystemMenu = new BPopUpMenu("system");
+		fSystemField = new BMenuField("systemField", "System:", fSystemMenu);
+		fPanel = NULL;
 
 		fList = new BListView("states", B_MULTIPLE_SELECTION_LIST);
 		fList->SetSelectionMessage(new BMessage(kMsgSelected));
@@ -981,7 +1095,11 @@ public:
 		BLayoutBuilder::Group<>(this, B_VERTICAL, B_USE_DEFAULT_SPACING)
 			.SetInsets(B_USE_WINDOW_INSETS)
 			.Add(intro)
-			.Add(hint)
+			.AddGroup(B_HORIZONTAL)
+				.Add(fSystemField)
+				.AddGlue()
+			.End()
+			.Add(fHint)
 			.Add(split)
 			.AddGroup(B_HORIZONTAL)
 				.Add(fRestore)
@@ -993,7 +1111,14 @@ public:
 			.End()
 			.Add(fStatus);
 
+		BuildSystemMenu();
+		UpdateModeTexts();
 		Reload();
+	}
+
+	~StateWindow()
+	{
+		delete fPanel;
 	}
 
 	bool QuitRequested()
@@ -1032,6 +1157,26 @@ public:
 			case kMsgRefresh:
 				Reload();
 				break;
+			case kMsgSystem:
+				SelectSystem(message->GetString("path", "/boot"));
+				break;
+			case kMsgOtherFolder:
+				if (fPanel == NULL) {
+					BMessage chosen(kMsgSystem);
+					fPanel = new BFilePanel(B_OPEN_PANEL, new BMessenger(this), NULL, B_DIRECTORY_NODE, false, &chosen);
+					fPanel->Window()->SetTitle("Choose the mounted Haiku system");
+				}
+				fPanel->Show();
+				break;
+			case B_REFS_RECEIVED:
+			{
+				entry_ref ref;
+				if (message->FindRef("refs", &ref) == B_OK) {
+					BPath path(&ref);
+					SelectSystem(path.Path());
+				}
+				break;
+			}
 			case kMsgWorkDone:
 				WorkDone(message);
 				break;
@@ -1128,9 +1273,93 @@ private:
 		UpdateButtons();
 	}
 
+	// The running system, every other mounted volume that holds a Haiku, and a way to pick a folder.
+	std::vector<std::string> FindSystems() const
+	{
+		std::vector<std::string> found;
+		BVolumeRoster roster;
+		BVolume volume;
+		dev_t bootDevice = dev_for_path("/boot");
+		while (roster.GetNextVolume(&volume) == B_OK) {
+			if (volume.Device() == bootDevice)
+				continue;
+			BDirectory root;
+			BPath path;
+			if (volume.GetRootDirectory(&root) != B_OK || path.SetTo(&root, NULL) != B_OK)
+				continue;
+			if (Exists(std::string(path.Path()) + "/system/packages/administrative/activated-packages"))
+				found.push_back(path.Path());
+		}
+		return found;
+	}
+
+	void BuildSystemMenu()
+	{
+		fSystems = FindSystems();
+		while (fSystemMenu->CountItems() > 0)
+			delete fSystemMenu->RemoveItem((int32)0);
+		BMessage* running = new BMessage(kMsgSystem);
+		running->AddString("path", "/boot");
+		BMenuItem* runningItem = new BMenuItem("This computer (the system running now)", running);
+		fSystemMenu->AddItem(runningItem);
+		bool marked = gRoot == "/boot";
+		runningItem->SetMarked(marked);
+		bool listed = marked;
+		for (size_t i = 0; i < fSystems.size(); i++) {
+			BMessage* message = new BMessage(kMsgSystem);
+			message->AddString("path", fSystems[i].c_str());
+			BString label(fSystems[i].c_str());
+			fSystemMenu->AddItem(new BMenuItem(label.String(), message));
+			if (fSystems[i] == gRoot) {
+				fSystemMenu->ItemAt(fSystemMenu->CountItems() - 1)->SetMarked(true);
+				listed = true;
+			}
+		}
+		if (!listed) {
+			BMessage* message = new BMessage(kMsgSystem);
+			message->AddString("path", gRoot.c_str());
+			BMenuItem* item = new BMenuItem(gRoot.c_str(), message);
+			fSystemMenu->AddItem(item);
+			item->SetMarked(true);
+		}
+		fSystemMenu->AddSeparatorItem();
+		fSystemMenu->AddItem(new BMenuItem("Another folder" B_UTF8_ELLIPSIS, new BMessage(kMsgOtherFolder)));
+	}
+
+	void SelectSystem(const std::string& path)
+	{
+		if (fBusy)
+			return;
+		std::string error = CheckRoot(path.empty() ? "/boot" : path);
+		if (!error.empty()) {
+			BAlert* alert = new BAlert("system", error.c_str(), "OK", NULL, NULL, B_WIDTH_AS_USUAL, B_STOP_ALERT);
+			alert->Go();
+			BuildSystemMenu();	// the mark goes back to the system that is still in use
+			return;
+		}
+		SetRoot(path.empty() ? "/boot" : path);
+		BuildSystemMenu();
+		UpdateModeTexts();
+		SetStatus("");
+		Reload();
+	}
+
+	void UpdateModeTexts()
+	{
+		if (gForeign) {
+			BString text("Working on the Haiku at ");
+			text << gRoot.c_str() << ", not the system running now. A restore writes its list of packages; start from it to use it.";
+			fHint->SetText(text.String());
+		} else {
+			fHint->SetText("A restore keeps what it replaces, and Undo puts it back. Restart afterwards for the old system to start.");
+		}
+		fRestart->SetEnabled(!gForeign);
+	}
+
 	void UpdateButtons()
 	{
 		std::vector<const State*> picked = SelectedStates();
+		fSystemField->SetEnabled(!fBusy);
 		fRestore->SetEnabled(!fBusy && picked.size() == 1 && SelectedPlanCanRun());
 		fUndo->SetEnabled(!fBusy && Exists(LastRestoreFile()));
 		fDelete->SetEnabled(!fBusy && !SelectedStates(true).empty());
@@ -1219,8 +1448,14 @@ private:
 		if (state == NULL || fBusy)
 			return;
 		BString question("Go back to the state of ");
-		question << state->label.c_str() << "?\n\nThe packages that differ are swapped. They are kept, and Undo puts "
-			"them back. You restart afterwards.";
+		if (gForeign) {
+			question << state->label.c_str() << " on " << gRoot.c_str() << "?\n\nThe packages that differ are swapped and "
+				"the list of active packages is written. What is taken out is kept as a state of that system, and Undo "
+				"puts it back. Start from that system afterwards.";
+		} else {
+			question << state->label.c_str() << "?\n\nThe packages that differ are swapped. They are kept, and Undo puts "
+				"them back. You restart afterwards.";
+		}
 		BAlert* alert = new BAlert("confirm", question.String(), "Cancel", "Restore", NULL, B_WIDTH_AS_USUAL,
 			B_WARNING_ALERT);
 		alert->SetShortcut(0, B_ESCAPE);
@@ -1253,7 +1488,10 @@ private:
 				<< " that can be restored now would not be restorable any more, because they need files kept in "
 				"the states you delete.";
 		}
-		question << "\n\nThe system you are running now is not touched.";
+		if (gForeign)
+			question << "\n\nThe system running now is not touched; this is the Haiku at " << gRoot.c_str() << ".";
+		else
+			question << "\n\nThe system you are running now is not touched.";
 		BAlert* alert = new BAlert("confirm", question.String(), "Cancel", "Delete", NULL, B_WIDTH_AS_USUAL,
 			B_STOP_ALERT);
 		alert->SetShortcut(0, B_ESCAPE);
@@ -1364,7 +1602,8 @@ private:
 				SetStatus(report.String());
 			else
 				SetStatus(kind == "restore"
-					? "Done. The system has the packages of that state; restart for it to start."
+					? (gForeign ? "Done. That system has the packages of that state; start from it."
+						: "Done. The system has the packages of that state; restart for it to start.")
 					: "Done. The packages of before the restore are back; restart for it to take effect.");
 		}
 		// the system takes a few seconds to write its record of the change
@@ -1376,6 +1615,11 @@ private:
 			fPreview->SetText(report.String());
 	}
 
+	BStringView*		fHint;
+	BPopUpMenu*			fSystemMenu;
+	BMenuField*			fSystemField;
+	BFilePanel*			fPanel;
+	std::vector<std::string> fSystems;
 	BListView*			fList;
 	BTextView*			fPreview;
 	BButton*			fRestore;
@@ -1430,6 +1674,19 @@ main(int argc, char** argv)
 	if (testFolder != NULL && testFolder[0] != '\0') {
 		kAdminDir = testFolder;
 		gTestFolder = true;
+	}
+
+	// StateRestore --root /Haiku1 <command>: another Haiku that is mounted
+	if (argc >= 3 && strcmp(argv[1], "--root") == 0) {
+		std::string error = CheckRoot(argv[2]);
+		if (!error.empty()) {
+			fprintf(stderr, "%s\n", error.c_str());
+			return 1;
+		}
+		SetRoot(argv[2]);
+		argc -= 2;
+		for (int i = 1; i < argc; i++)
+			argv[i] = argv[i + 2];
 	}
 
 	if (argc >= 2) {
@@ -1536,7 +1793,7 @@ main(int argc, char** argv)
 			printf("%s\n", error.empty() ? where.c_str() : error.c_str());
 			return error.empty() ? 0 : 1;
 		}
-		fprintf(stderr, "StateRestore [--list | --plan <state> | --restore <state> [--dry-run] | --undo | --delete <state>... [--dry-run] | --cleanup [--dry-run] | --syslog]\n");
+		fprintf(stderr, "StateRestore [--root <mounted Haiku>] [--list | --plan <state> | --restore <state> [--dry-run] | --undo | --delete <state>... [--dry-run] | --cleanup [--dry-run] | --syslog]\n");
 		return 1;
 	}
 

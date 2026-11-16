@@ -2,7 +2,7 @@
 # The one place a release changes is the VERSION file.
 TARGET = StateRestore
 CXXFLAGS = -Wall -O2 -std=c++11
-LIBS = -lbe
+LIBS = -lbe -ltracker
 
 # On 32-bit Haiku the program is built with the newer secondary-architecture compiler, as Cricket is, against the libraries
 # in /boot/system/lib/x86 (the gcc 2 compiler cannot build C++11).

@@ -29,6 +29,20 @@ The window also has **Restart…**, with a confirmation.
 It only helps when the system still boots. A system that does not start at all needs the boot menu or a rescue disk.
 Only the system packages are handled, not the ones in `~/config/packages`.
 
+## Another Haiku on another partition
+
+Run StateRestore from a Haiku that works to repair one that does not start. Mount the other Haiku's partition (it shows as
+`/Haiku1`, say), then choose it in the **System** menu at the top of the window (every mounted volume that holds a Haiku is
+listed, or pick **Another folder...**). From the command line: `StateRestore --root /Haiku1 --list`, and the same for the other
+commands.
+
+The window then works on that system's states: restoring, undoing and deleting. Because no package daemon runs there, a restore
+also writes that system's list of active packages (what it reads when it starts) and keeps what it took out as a new
+`state_<date>_<time>` folder of that system, as the daemon would, so that Undo or the boot menu can go back. Start from that
+system afterwards. **Restart** is greyed out there, since it would restart the system you are running.
+
+The partition must be mounted with write access.
+
 ## Install
 
 Install `staterestore-<version>-1-x86_64.hpkg` (64-bit Haiku) or `staterestore-<version>-1-x86_gcc2.hpkg` (32-bit Haiku) from the
